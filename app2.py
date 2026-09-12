@@ -591,6 +591,34 @@ def marginal_slab_rate(cum_units: float) -> float:
     return SLAB_TIERS[-1][1]
 
 
+def slab_bill_for_lump_kwh(kwh: float) -> float:
+    """Progressive slab bill for a single lump kWh quantity (starting from 0 units this cycle),
+    with NO time-of-day/TOD/rebate adjustment.
+
+    This is what a real 1:1 net-metering settlement actually bills: the physical meter only
+    ever reports a NET kWh reading (import minus simultaneous export), so once export has been
+    netted against import there is no per-row time-of-day information left to re-apply a TOD
+    surcharge or solar-hour rebate to — those only make sense against a raw, un-netted import
+    stream. Used by `compute_financials()` for the Net-Metering settlement path, in place of
+    scaling an already-computed (and therefore wrongly slab-positioned) gross bill.
+    """
+    if kwh <= 0:
+        return 0.0
+    remaining = kwh
+    bill = 0.0
+    prev_cap = 0.0
+    for cap, rate in SLAB_TIERS:
+        width = cap - prev_cap
+        used = min(remaining, width)
+        if used > 0:
+            bill += used * rate
+            remaining -= used
+        prev_cap = cap
+        if remaining <= 1e-9:
+            break
+    return bill
+
+
 def in_window(t: dtime, start: dtime, end: dtime) -> bool:
     """True if t falls in [start, end), handling windows that wrap past midnight."""
     if start <= end:
@@ -614,7 +642,7 @@ def effective_rate(t: dtime, cum_units: float, tariff: dict) -> float:
 # STRICT DATA PROCESSING (Section 1 of spec)
 # =====================================================================
 def preprocess(raw: pd.DataFrame, grid_v_min: float, grid_v_max: float, power_factor: float,
-               cycle_days: int) -> pd.DataFrame:
+               cycle_days: int, cycle_start_date: "pd.Timestamp | None" = None) -> pd.DataFrame:
     df = raw.copy()
     df.columns = [c.strip() for c in df.columns]
 
@@ -646,10 +674,19 @@ def preprocess(raw: pd.DataFrame, grid_v_min: float, grid_v_max: float, power_fa
     df["Grid_Status"] = ((df["Grid voltage(V)"] >= grid_v_min) & (df["Grid voltage(V)"] <= grid_v_max)).astype(int)
     df["t_of_day"] = df["Timestamp"].dt.time
 
-    # Slab/billing cycle resets every `cycle_days` from the first timestamp in the dataset
-    # (electricity boards typically run bi-monthly cycles; kept as a UI-configurable variable).
-    first_date = df["Timestamp"].min().normalize()
-    df["cycle_id"] = ((df["Timestamp"].dt.normalize() - first_date).dt.days // cycle_days).astype(int)
+    # Slab/billing cycle resets every `cycle_days`, anchored to the CUSTOMER'S REAL bill-cycle
+    # start date when one is supplied (`cycle_start_date`) — falls back to the dataset's own
+    # first timestamp only when no real start date is given. Anchoring to the data's first row
+    # by default is just a convenience assumption (the dataset may start mid-cycle relative to
+    # the real meter), so treat that fallback as an approximation, not the customer's true cycle.
+    if cycle_start_date is not None:
+        anchor_date = pd.Timestamp(cycle_start_date).normalize()
+        # if the data starts before the given anchor, count backwards so cycle_id can be
+        # negative for pre-anchor rows rather than silently misaligning the boundary.
+        first_date = anchor_date
+    else:
+        first_date = df["Timestamp"].min().normalize()
+    df["cycle_id"] = np.floor((df["Timestamp"].dt.normalize() - first_date).dt.days / cycle_days).astype(int)
 
     return df
 
@@ -658,42 +695,83 @@ def preprocess(raw: pd.DataFrame, grid_v_min: float, grid_v_max: float, power_fa
 # ROW-BY-ROW SIMULATION ENGINE
 # =====================================================================
 def simulate(df: pd.DataFrame, mode: str, tariff: dict, battery: dict = None, reserve_pct: float = 0.20,
-             max_charge_pct: float = 1.0, pv_zero_threshold_kwh: float = 0.0) -> dict:
+             max_charge_pct: float = 1.0, pv_zero_threshold_kwh: float = 0.0,
+             initial_soc_pct: float = None) -> dict:
     """
     mode: 'grid_tie' | 'dumb' | 'smart'
 
     Financial accounting is done LIVE, row-by-row, alongside the energy simulation:
       - `baseline_bill`   : what the full household demand would cost, at the time-and-slab
-                            aware rate, cycle by cycle (the "no solar at all" counterfactual).
+                            aware rate, cycle by cycle (the "no solar at all" counterfactual) —
+                            counted ONLY on grid-up rows. A plain no-solar/no-battery house also
+                            has zero service (and is billed zero) during a real grid outage, so
+                            outage rows contribute nothing to this counterfactual either; the
+                            value of energy actually kept flowing during an outage is instead
+                            captured separately, in full, as `outage_bill_notional` below — never
+                            inside this bill-delta baseline.
       - `actual_bill_gross`: what was REALLY billed for every real grid import (serving load
                             OR charging the battery), at the rate that applied at that moment.
       - `outage_bill_notional`: the notional cost of energy served by PV/battery during a grid
                             outage, valued at the rate it would have carried in the baseline
-                            stream (replaces a flat VoLL with the actual applicable slab/TOD price).
+                            stream (replaces a flat VoLL with the actual applicable slab/TOD
+                            price). This is a genuinely SEPARATE resilience benefit — since
+                            `baseline_bill` no longer counts outage-time load at all, this value
+                            is never embedded in (Base − Actual) and so is added on top in
+                            `compute_financials()`, not subtracted out of it.
       - `tod_optimization`: Smart-Hybrid-only. Battery energy discharged to load, while grid is
                             up, during the TOD-surcharge (peak) window. PV-origin energy (free)
                             is credited in full at the current avoided rate; grid-origin energy
                             is credited only the DIFFERENCE between the avoided rate now and
                             the (weighted-average) rate it actually cost when it was charged —
-                            since that unit was already billed once, in `actual_bill_gross`.
+                            since that unit was already billed once, in `actual_bill_gross`. This
+                            value IS already embedded in (Base − Actual) (grid-up battery
+                            discharge lowers Actual Bill directly), so it's subtracted back out
+                            of the residual in `compute_financials()` to avoid double counting.
 
     Battery SOC is split into two provenance buckets so grid-origin kWh can be told apart from
     free PV-origin kWh when valuing a later discharge (`soc_pv`, `soc_grid` + a running
     weighted-average `grid_cost_basis` ₹/kWh for the grid-origin bucket). This is what lets
     Solar Savings / TOD Optimization / Outage Savings partition (Base − Actual) without any
     kWh being counted as a saving twice (see solar_savings' residual definition below).
+
+    Efficiency: `battery["efficiency"]` is documented (UI) as a single ROUND-TRIP number, but a
+    round trip has two legs (charge in, discharge out). Applying the full round-trip value on
+    EACH leg (as this function used to) compounds it into `eff²` for any energy that is charged
+    and later discharged — silently double-penalizing grid-sourced battery cycles. Splitting the
+    round-trip figure into `charge_eff = discharge_eff = sqrt(round_trip_eff)` on each leg is the
+    standard fix: a full charge-then-discharge cycle now correctly nets back to `round_trip_eff`
+    (sqrt(x) * sqrt(x) = x), while still modeling a real loss on each individual leg. This also
+    now applies charge_eff on the PV → battery leg, which previously had NO loss modeled at all
+    (physically inconsistent with the same battery's converter/charger losing energy regardless
+    of whether the source is PV or grid).
     """
     usable_kwh = battery["capacity_kwh"] * battery["dod"] if battery else 0.0
-    eff = battery["efficiency"] if battery else 1.0
+    eff_round_trip = battery["efficiency"] if battery else 1.0
+    charge_eff = float(np.sqrt(eff_round_trip)) if eff_round_trip > 0 else 0.0
+    discharge_eff = float(np.sqrt(eff_round_trip)) if eff_round_trip > 0 else 0.0
     reserve_soc = usable_kwh * reserve_pct if battery else 0.0
     max_soc = usable_kwh * max_charge_pct if battery else 0.0
 
-    # Both hybrids start fully charged (max-charge ceiling). Initial charge is treated as
-    # PV-origin (cost-free) by convention — it's a starting assumption, not a real purchase.
-    soc_pv = max_soc
+    # Starting SOC is configurable (real telemetry rarely starts at a convenient 100%). Defaults
+    # to the max-charge ceiling if not given, preserving old behaviour for anyone not using this.
+    start_soc = max_soc if initial_soc_pct is None else max(0.0, min(usable_kwh, initial_soc_pct / 100.0 * usable_kwh))
+    # Starting charge is treated as PV-origin (cost-free) by convention — a starting assumption,
+    # not a real purchase.
+    soc_pv = start_soc
     soc_grid = 0.0
     grid_cost_basis = 0.0
     soc = soc_pv + soc_grid
+
+    def charge_from_pv(pv_available_kwh: float, room_kwh: float):
+        """PV-origin charging, WITH charge_eff loss now applied (previously lossless).
+        Returns (soc_increase, pv_consumed) — soc_increase <= pv_consumed whenever charge_eff<1,
+        modeling real converter/charging loss on this leg just like the grid-charging leg below.
+        """
+        if pv_available_kwh <= 0 or room_kwh <= 0 or charge_eff <= 0:
+            return 0.0, 0.0
+        soc_increase = min(pv_available_kwh * charge_eff, room_kwh)
+        pv_consumed = soc_increase / charge_eff
+        return soc_increase, pv_consumed
 
     def discharge_from_buckets(discharge_gross: float):
         nonlocal soc_pv, soc_grid, soc
@@ -737,10 +815,17 @@ def simulate(df: pd.DataFrame, mode: str, tariff: dict, battery: dict = None, re
         row_export_amt = 0.0
         row_bill_amt = 0.0
 
-        # --- baseline (no-solar-at-all) bill contribution, every row, every mode ---
+        # --- baseline (no-solar-at-all) bill contribution — GRID-UP ROWS ONLY ---
+        # A plain no-solar/no-battery house also has no power (and pays nothing) during a real
+        # grid outage, so outage rows must NOT add to this counterfactual bill (they used to,
+        # unconditionally, which let unserved load's notional value leak into Solar Savings as a
+        # false residual — see the docstring above). `rate_baseline` is still computed every row
+        # (frozen at whatever cumulative position baseline_cum_cycle has reached) so that energy
+        # actually served during an outage can still be valued at a sensible marginal rate below.
         rate_baseline = effective_rate(t, baseline_cum_cycle, tariff)
-        baseline_bill += rate_baseline * load
-        baseline_cum_cycle += load
+        if grid_up:
+            baseline_bill += rate_baseline * load
+            baseline_cum_cycle += load
 
         if mode == "grid_tie":
             if grid_up:
@@ -771,11 +856,11 @@ def simulate(df: pd.DataFrame, mode: str, tariff: dict, battery: dict = None, re
                 u = min(pv, load)
                 pv_to_load += u
                 pv_rem = pv - u
-                charge = min(pv_rem, max(max_soc - soc, 0.0))
+                charge, pv_used = charge_from_pv(pv_rem, max(max_soc - soc, 0.0))
                 soc_pv += charge
                 soc += charge
                 pv_to_battery += charge
-                pv_rem -= charge
+                pv_rem -= pv_used
                 export += pv_rem
                 row_export_amt += pv_rem
                 imp = load - u
@@ -790,7 +875,7 @@ def simulate(df: pd.DataFrame, mode: str, tariff: dict, battery: dict = None, re
 
                 if pv <= pv_zero_threshold_kwh and soc < max_soc:
                     charge_needed = max_soc - soc
-                    grid_pull = charge_needed / eff if eff > 0 else 0.0
+                    grid_pull = charge_needed / charge_eff if charge_eff > 0 else 0.0
                     rate_now = effective_rate(t, actual_cum_cycle, tariff)
                     bill_amt = rate_now * grid_pull
                     actual_bill_gross += bill_amt
@@ -813,11 +898,11 @@ def simulate(df: pd.DataFrame, mode: str, tariff: dict, battery: dict = None, re
                     u = load
                     pv_to_load += u
                     pv_rem = pv - u
-                    charge = min(pv_rem, max(max_soc - soc, 0.0))
+                    charge, pv_used = charge_from_pv(pv_rem, max(max_soc - soc, 0.0))
                     soc_pv += charge
                     soc += charge
                     pv_to_battery += charge
-                    pv_rem -= charge
+                    pv_rem -= pv_used
                     export += pv_rem
                     row_export_amt += pv_rem
                 else:
@@ -826,11 +911,11 @@ def simulate(df: pd.DataFrame, mode: str, tariff: dict, battery: dict = None, re
                     pv_to_load += u
                     deficit = load - pv
                     avail_above_reserve = max(soc - reserve_soc, 0.0)
-                    discharge_gross = min(avail_above_reserve, deficit / eff)
+                    discharge_gross = min(avail_above_reserve, deficit / discharge_eff)
                     from_pv_g, from_grid_g = discharge_from_buckets(discharge_gross)
-                    delivered = discharge_gross * eff
-                    delivered_pv = from_pv_g * eff
-                    delivered_grid = from_grid_g * eff
+                    delivered = discharge_gross * discharge_eff
+                    delivered_pv = from_pv_g * discharge_eff
+                    delivered_grid = from_grid_g * discharge_eff
                     batt_to_load += delivered
                     rem_deficit = deficit - delivered
                     if rem_deficit > 0:
@@ -851,7 +936,7 @@ def simulate(df: pd.DataFrame, mode: str, tariff: dict, battery: dict = None, re
 
                 if not solar_hr and soc < reserve_soc:
                     charge_needed = reserve_soc - soc
-                    grid_pull = charge_needed / eff if eff > 0 else 0.0
+                    grid_pull = charge_needed / charge_eff if charge_eff > 0 else 0.0
                     rate_now = effective_rate(t, actual_cum_cycle, tariff)
                     bill_amt = rate_now * grid_pull
                     actual_bill_gross += bill_amt
@@ -873,9 +958,9 @@ def simulate(df: pd.DataFrame, mode: str, tariff: dict, battery: dict = None, re
             u = min(pv, load)
             pv_to_load += u
             load_rem = load - u
-            discharge_gross = min(soc, load_rem / eff)
+            discharge_gross = min(soc, load_rem / discharge_eff)
             discharge_from_buckets(discharge_gross)
-            delivered = discharge_gross * eff
+            delivered = discharge_gross * discharge_eff
             batt_to_load += delivered
             load_rem -= delivered
 
@@ -885,11 +970,11 @@ def simulate(df: pd.DataFrame, mode: str, tariff: dict, battery: dict = None, re
             outage_bill_notional += row_outage_amt * rate_baseline
 
             pv_rem = pv - u
-            charge = min(pv_rem, max(max_soc - soc, 0.0))
+            charge, pv_used = charge_from_pv(pv_rem, max(max_soc - soc, 0.0))
             soc_pv += charge
             soc += charge
             pv_to_battery += charge
-            pv_rem -= charge
+            pv_rem -= pv_used
             notional_loss += pv_rem
 
         row_cycle_ids.append(cyc)
@@ -936,17 +1021,39 @@ def simulate(df: pd.DataFrame, mode: str, tariff: dict, battery: dict = None, re
 # =====================================================================
 def compute_financials(res: dict, net_metering: bool, export_rate: float) -> dict:
     """
-      Base Bill    = time+slab+cycle aware bill on the FULL household demand (no solar at all).
+      Base Bill    = time+slab+cycle aware bill on the FULL household demand (no solar at all),
+                     counted only on grid-up rows (see simulate()'s docstring — outage-time load
+                     is not part of this counterfactual at all, so it can't leak into savings).
       Actual Bill  = time+slab+cycle aware bill on what was REALLY imported (load AND any
-                     battery charging), net-metering-settled if applicable.
+                     battery charging). For NET METERING this is now a true 1:1 settlement: the
+                     settled kWh is netted off FIRST, then the remaining net import is re-billed
+                     by running it through the slab tiers from scratch (`slab_bill_for_lump_kwh`)
+                     — NOT the old approach of scaling an already-computed gross bill, which
+                     silently mis-priced the settlement whenever slab tiers are non-linear (e.g.
+                     900 kWh gross / 400 kWh export -> 500 kWh net: the old scaling method gave
+                     ~Rs 7,306 vs the correct re-billed Rs 6,150 for the same numbers — a ~19%
+                     error, not a rounding difference). A real net-metered connection only ever
+                     reports a NET kWh reading at the meter, so no per-row time-of-day/TOD/rebate
+                     structure survives the netting — hence the lump slab-only bill, not a
+                     per-row rate.
       Outage Savings = notional cost, at the rate that would have applied, of energy served by
-                     PV/battery during a grid outage (replaces a flat VoLL).
+                     PV/battery during a grid outage (replaces a flat VoLL). This is a genuinely
+                     SEPARATE resilience benefit now — since Base Bill no longer counts outage
+                     rows at all, this value is never embedded in (Base - Actual), so it is ADDED
+                     on top rather than subtracted out of the residual below (previously, Base
+                     Bill DID count full outage-time load, which meant any UNSERVED portion of it
+                     leaked into Solar Savings as a false residual — worst for Grid-Tie, where an
+                     entire outage's load value used to show up as "Solar Savings" despite 0 kWh
+                     ever being delivered).
       TOD Optimization = Smart-Hybrid-only arbitrage credit for battery energy discharged to
-                     load during the TOD-surcharge window (see simulate()'s docstring).
-      Solar Savings = (Base Bill - Actual Bill) - Outage Savings - TOD Optimization
-                     — the RESIDUAL of the true bill delta after removing the other two, so the
-                     three savings buckets are a strict, non-overlapping partition of the real
-                     bill difference: no kWh's value is ever counted under more than one bucket.
+                     load during the TOD-surcharge window (see simulate()'s docstring) — THIS one
+                     genuinely IS already embedded in (Base - Actual) (grid-up battery discharge
+                     directly lowers Actual Bill), so it must stay subtracted out of the residual
+                     to avoid double-counting it.
+      Solar Savings = (Base Bill - Actual Bill) - TOD Optimization
+                     — the RESIDUAL of the true bill delta after removing TOD Optimization (the
+                     only one of the other two buckets actually embedded in this delta), so no
+                     kWh's value is ever counted under more than one bucket.
       Solar Earning = min(cycle PV export, cycle grid import) x export_rate, ONLY for
                      Non-Net-Metering (kept as its own column — never folded into Solar Savings).
       Net Savings   = Solar Savings + Outage Savings + TOD Optimization (Solar Earning is real
@@ -968,23 +1075,20 @@ def compute_financials(res: dict, net_metering: bool, export_rate: float) -> dic
     cyc["settled"] = np.minimum(cyc["import_sum"], cyc["export_sum"])
 
     if net_metering:
-        # 1:1 settlement nets export against import WITHIN each cycle. Each row's import is
-        # scaled down by that cycle's netting fraction and re-billed at the SAME per-row rate
-        # it was actually charged at, so the time-of-day rate structure is preserved while
-        # exactly the settled kWh worth of billing is removed, cycle by cycle.
-        cyc["scale"] = np.where(
-            cyc["import_sum"] > 1e-12,
-            np.maximum(cyc["import_sum"] - cyc["settled"], 0.0) / cyc["import_sum"],
-            1.0,
-        )
-        rows = rows.merge(cyc[["cycle_id", "scale"]], on="cycle_id", how="left")
-        actual_bill = float((rows["bill"] * rows["scale"]).sum())
+        # TRUE 1:1 settlement: net off the settled kWh first, then re-bill the remaining NET
+        # import per cycle through the slab tiers from scratch — this is what a real net meter
+        # actually reports (a single net kWh reading), so there is no per-row TOD/rebate
+        # structure left to preserve. Recomputing on the net quantity (instead of scaling the
+        # gross, already slab-priced bill) is what fixes the non-linear-slab mispricing above.
+        cyc["net_import"] = np.maximum(cyc["import_sum"] - cyc["settled"], 0.0)
+        cyc["net_bill"] = cyc["net_import"].apply(slab_bill_for_lump_kwh)
+        actual_bill = float(cyc["net_bill"].sum())
         solar_earning = 0.0
     else:
         actual_bill = res["actual_bill_gross"]
         solar_earning = float(cyc["settled"].sum()) * export_rate
 
-    solar_savings = (baseline_bill - actual_bill) - outage_savings - tod_optimization
+    solar_savings = (baseline_bill - actual_bill) - tod_optimization
     net_savings = solar_savings + outage_savings + tod_optimization
 
     res["baseline_bill"] = baseline_bill
@@ -1006,30 +1110,36 @@ st.title("☀️ Solar Inverter Time-Series Simulator")
 st.caption("Grid-Tie vs Dumb Hybrid vs Smart Hybrid — row-by-row 5-minute simulation, instantaneous-power based, fully auditable.")
 
 with st.expander("🔎 Where Efficiency, Charge Rate & Discharge Rate Are Used (both batteries) — click to read"):
+    _li_eff = BATTERY_PRESETS['Lithium (48V / 314Ah)']['efficiency']
+    _la_eff = BATTERY_PRESETS['Lead-Acid (48V / 200Ah)']['efficiency']
     st.markdown(f"""
-**Efficiency — a single round-trip number, not separate charge/discharge/coulombic values.**
+**Efficiency — one ROUND-TRIP number per chemistry, split into a charge leg and a discharge leg.**
 
-`BATTERY_PRESETS` sets one `efficiency` scalar per chemistry — **Lithium = {BATTERY_PRESETS['Lithium (48V / 314Ah)']['efficiency']*100:.0f}%**,
-**Lead-Acid = {BATTERY_PRESETS['Lead-Acid (48V / 200Ah)']['efficiency']*100:.0f}%** — and `simulate()` uses the exact same formulas for
-both chemistries, just with that different number plugged in as `eff`. There is no separate "charging
-efficiency" vs "discharging efficiency" vs "round-trip efficiency" concept in this part of the app — it's
-one number, and where it gets applied is asymmetric:
+`BATTERY_PRESETS` still sets a single `efficiency` scalar per chemistry — **Lithium = {_li_eff*100:.0f}%**,
+**Lead-Acid = {_la_eff*100:.0f}%** — but that number is documented (and now treated) as the ROUND-TRIP
+efficiency: what you get back out for what you put in, over one full charge-then-discharge cycle.
+`simulate()` now converts it into `charge_eff = discharge_eff = sqrt(round_trip)` — **Lithium ≈{np.sqrt(_li_eff)*100:.1f}%
+per leg**, **Lead-Acid ≈{np.sqrt(_la_eff)*100:.1f}% per leg** — and applies that SAME per-leg number
+consistently on every charging AND discharging path, so a full cycle multiplies back to exactly the
+configured round-trip value (`sqrt(x) × sqrt(x) = x`) instead of silently compounding to `round_trip²`.
+This fixes a previous bug where the full round-trip number was applied on BOTH legs of a grid-sourced
+cycle (paying `charge_needed / eff` in, then `× eff` back out) — realizing `eff²` round-trip instead of
+`eff` for any energy that went through the grid.
 
-- **Grid → Battery charging** (`grid_pull = charge_needed / eff`): the battery's SOC goes up by exactly
-  `charge_needed`, but the grid import (and its cost) is inflated to `charge_needed / eff` — i.e. you pay
-  for more than lands in the battery. `eff` is applied HERE.
-- **Battery → Load discharging** (`discharge_gross = deficit / eff`, then `delivered = discharge_gross * eff`):
-  SOC is drawn down by more than what actually reaches the load — `eff` is applied HERE too.
-- **PV → Battery charging** (`charge = min(pv_rem, room)`): PV surplus lands in the battery **1:1, with NO
-  efficiency loss applied at all** — this path does not use `eff`.
+- **Grid → Battery charging** (`grid_pull = charge_needed / charge_eff`): the battery's SOC goes up by
+  exactly `charge_needed`, but the grid import (and its cost) is inflated to `charge_needed / charge_eff`.
+- **Battery → Load discharging** (`discharge_gross = deficit / discharge_eff`, then
+  `delivered = discharge_gross * discharge_eff`): SOC is drawn down by more than what actually reaches
+  the load.
+- **PV → Battery charging** (`charge_from_pv()`): now ALSO applies `charge_eff` — previously this leg was
+  modeled as lossless (1:1), which was physically inconsistent with the same charger/converter losing
+  energy regardless of whether the source is PV or grid. PV surplus beyond what's needed to hit the SOC
+  ceiling (accounting for this loss) is exported instead.
 
-**Net effect (same for both chemistries, just different `eff` value):** a kWh that came from PV and is
-later discharged to load loses efficiency ONCE (at discharge). A kWh that came from the GRID, got stored,
-and is later discharged loses efficiency TWICE (once charging in, once discharging out) — effectively
-`eff²` round-trip for grid-sourced battery energy, vs `eff` for PV-sourced battery energy. For Lead-Acid
-(eff=0.80) that's 80% vs 64%; for Lithium (eff=0.95) that's 95% vs 90.25%. This asymmetry exists in the
-current formulas for BOTH chemistries — flagging it here rather than changing it silently, since it's a
-pre-existing formula.
+**Net effect:** a kWh that came from PV and is later discharged to load now loses `charge_eff × discharge_eff
+= round_trip` once, the same as a kWh that came from the GRID and was later discharged — both now correctly
+realize the configured round-trip efficiency end-to-end, instead of the old `eff` vs `eff²` asymmetry between
+PV-sourced and grid-sourced battery energy.
 
 **Charge rate / discharge rate (C-rate) — NOT modeled anywhere in `simulate()`.** There is currently no
 cap on how much power the battery can accept or deliver in a single 5-minute interval based on a hardware
@@ -1076,9 +1186,26 @@ with st.sidebar:
         help="Ceiling on charging (PV or grid) as a % of usable capacity. Some batteries "
              "stabilise at e.g. 98% rather than reaching a literal 100% full charge."
     ) / 100.0
+    use_actual_start_soc = st.checkbox(
+        "Start simulation from a real measured SOC instead of assuming full", value=False,
+        help="Both hybrids used to always start the simulation at the max-charge ceiling (100% of "
+             "the configured ceiling), even when the uploaded data is a real, short field export "
+             "whose actual starting SOC at row 1 was something else entirely. Turn this on to set "
+             "the real starting SOC for THIS run instead of assuming a full battery."
+    )
+    initial_soc_pct = st.slider(
+        "Starting SOC at the first row of the uploaded file (%)", 0, 100, 100,
+        disabled=not use_actual_start_soc,
+        help="Only used when the checkbox above is on. 100% reproduces the old always-starts-full "
+             "assumption exactly."
+    ) if use_actual_start_soc else None
     st.caption(
-        f"Both hybrids start the simulation fully charged, i.e. at the {int(max_charge_pct*100)}% "
-        f"max-charge ceiling ({battery['capacity_kwh']*battery['dod']*max_charge_pct:.2f} kWh)."
+        f"Simulation starts at "
+        + (f"the real measured SOC you set above ({initial_soc_pct}% of usable capacity)."
+           if use_actual_start_soc else
+           f"the {int(max_charge_pct*100)}% max-charge ceiling "
+           f"({battery['capacity_kwh']*battery['dod']*max_charge_pct:.2f} kWh) — the old default "
+           f"assumption, since no real starting SOC was supplied for this run.")
     )
     reserve_pct = st.slider(
         "Smart Hybrid — Reserve SOC (%, kept for outages during grid-up discharge)", 0, 100, 20,
@@ -1107,6 +1234,17 @@ with st.sidebar:
         help="Cumulative kWh used to pick the slab rate resets to 0 at the start of every "
              "cycle (e.g. MSEDCL residential bills bi-monthly ≈ 60 days). Board-specific."
     )
+    use_real_cycle_start = st.checkbox(
+        "Anchor billing cycles to the customer's real bill-cycle start date", value=False,
+        help="Cycles used to always reset from the FIRST TIMESTAMP IN THE UPLOADED FILE — an "
+             "assumption of convenience, not the customer's actual meter-reading/bill date. If "
+             "the uploaded data doesn't start exactly on the real cycle boundary, slab tiers would "
+             "reset at the wrong point. Turn this on and set the real date once you know it."
+    )
+    cycle_start_date = st.date_input(
+        "Real billing-cycle start date", value=None, disabled=not use_real_cycle_start,
+        help="e.g. the date of the customer's last real meter reading / bill issue."
+    ) if use_real_cycle_start else None
     col_sh1, col_sh2 = st.columns(2)
     solar_start = col_sh1.time_input("Solar hours start", dtime(9, 0))
     solar_end = col_sh2.time_input("Solar hours end", dtime(18, 0))
@@ -1544,7 +1682,7 @@ sensor readings, Battery Capacity(%) stays within a valid 0-100% range, and ever
 
 try:
     df = preprocess(raw_df, grid_v_min=grid_v_min, grid_v_max=grid_v_max, power_factor=power_factor,
-                     cycle_days=cycle_days)
+                     cycle_days=cycle_days, cycle_start_date=cycle_start_date)
 except Exception as e:
     st.error(f"Could not process the uploaded file: {e}")
     st.stop()
@@ -1583,8 +1721,10 @@ with st.expander("Preview cleaned data (first 20 rows)"):
 # Run simulations
 # ---------------------------------------------------------------
 res_gt = simulate(df, "grid_tie", tariff)
-res_dumb = simulate(df, "dumb", tariff, battery, reserve_pct, max_charge_pct, pv_zero_threshold_kwh)
-res_smart = simulate(df, "smart", tariff, battery, reserve_pct, max_charge_pct, pv_zero_threshold_kwh)
+res_dumb = simulate(df, "dumb", tariff, battery, reserve_pct, max_charge_pct, pv_zero_threshold_kwh,
+                     initial_soc_pct=initial_soc_pct)
+res_smart = simulate(df, "smart", tariff, battery, reserve_pct, max_charge_pct, pv_zero_threshold_kwh,
+                      initial_soc_pct=initial_soc_pct)
 
 for res in (res_gt, res_dumb, res_smart):
     compute_financials(res, net_metering_enabled, export_rate)
@@ -1777,23 +1917,28 @@ render_metric(
 render_metric(
     "solar_savings",
     """
-The RESIDUAL of the true bill delta after removing Outage Savings and TOD Optimization from it — by
-construction this guarantees no kWh's value is ever counted in more than one savings bucket:
+The RESIDUAL of the true bill delta after removing TOD Optimization from it — the only one of the other two
+savings buckets that is actually embedded inside this bill delta (Outage Savings is now a wholly separate,
+additive resilience benefit — see its own explainer below for why):
 
-`Solar Savings = (Base Bill − Actual Bill) − Outage Savings − TOD Optimization`
+`Solar Savings = (Base Bill − Actual Bill) − TOD Optimization`
 
-- **Base Bill** = time+slab+cycle-aware bill on the FULL household demand (the "no solar at all" counterfactual —
-  same rate rules: slab tier, TOD surcharge %, solar-hour rebate).
+- **Base Bill** = time+slab+cycle-aware bill on the FULL household demand, counted **only on grid-up rows**
+  (the "no solar/battery at all, same grid reliability" counterfactual — a plain-grid house also gets zero
+  service, and pays zero, during a real outage, so outage-time load is not part of this counterfactual bill
+  at all — see `simulate()`'s docstring for why this matters).
 - **Actual Bill** = time+slab+cycle-aware bill on what was REALLY imported (serving load *and* any battery
-  charging), net-metering-settled if that mode is selected.
+  charging). Under **Net Metering**, this is a true 1:1 settlement: settled kWh is netted off first, then the
+  remaining net import per cycle is re-billed from scratch through the slab tiers (`slab_bill_for_lump_kwh`) —
+  not a scaled-down version of the gross bill, which mis-prices non-linear slabs.
 
-The solar-hour rebate is a board discount, not an inverter saving — it's baked directly into both bills' per-unit
-rate (see Tariff & Billing Cycle in the sidebar), never added again here.
+The solar-hour rebate is a board discount, not an inverter saving — it's baked directly into Base Bill's
+per-unit rate (see Tariff & Billing Cycle in the sidebar), never added again here.
     """,
-    r"Solar_{savings} = (Base\ Bill - Actual\ Bill) - Outage_{savings} - TOD_{optimization}",
+    r"Solar_{savings} = (Base\ Bill - Actual\ Bill) - TOD_{optimization}",
     lambda inv, r: (
         f"(Base Bill ₹{f2(r['baseline_bill'])} − Actual Bill ₹{f2(r['actual_bill'])}) "
-        f"− Outage Savings ₹{f2(r['outage_savings'])} − TOD Optimization ₹{f2(r['tod_optimization'])} "
+        f"− TOD Optimization ₹{f2(r['tod_optimization'])} "
         f"= **₹{f2(r['solar_savings'])}**"
     ),
 )
@@ -1826,6 +1971,13 @@ render_metric(
 - **Dumb / Smart Hybrid**: every kWh served by PV or battery *while the grid is down* is valued at the
   **actual grid price** that would have applied at that exact slab-cycle position and time of day (including the
   solar-hour rebate if the outage falls in solar hours) — not a flat VoLL.
+
+This is a genuinely SEPARATE resilience benefit, added on top of Solar Savings rather than carved out of it:
+Base Bill no longer counts any outage-time load (see Solar Savings above), so none of this value is embedded
+in (Base − Actual) to begin with — nothing here is double-counted with Solar Savings. (Previously, Base Bill
+DID count full outage-time load including whatever went unserved, which let the *unserved* portion silently
+show up as phantom "Solar Savings" — worst for Grid-Tie, where 100% of every outage's load value used to leak
+in that way despite 0 kWh ever being delivered. Unserved load itself is never valued as a saving anywhere now.)
     """,
     r"Outage_{savings} = \sum_{i \in Grid\ Down} \big(PV_{to\ load,i} + Batt_{to\ load,i}\big) \times rate_{baseline}(t_i,\ cum_i)",
     lambda inv, r: f"{f2(r['outage_served'])} kWh valued row-by-row at the applicable slab/TOD rate = **₹{f2(r['outage_savings'])}**",
