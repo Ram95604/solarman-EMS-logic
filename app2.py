@@ -5,7 +5,23 @@ from datetime import time as dtime
 
 st.set_page_config(page_title="Solar Inverter Time-Series Simulator", layout="wide")
 
-DT_HOURS = 5.0 / 60.0                       # fixed 5-minute interval, per strict spec
+DT_HOURS = 5.0 / 60.0                       # NOMINAL/fallback cadence only (first-row seed, display
+                                             # text) — real energy integration now uses each row's
+                                             # OWN actual elapsed time (`dt_hours` column, added in
+                                             # preprocess()), not this fixed constant. Real 5-min-
+                                             # interval feeds routinely arrive faster/slower than an
+                                             # exact 5.00 minutes (observed: mean ~4.83 min on a real
+                                             # plant file), so multiplying every row by a fixed 5-min
+                                             # constant systematically over/under-counts energy across
+                                             # a multi-week file — confirmed on a real 31-day extract
+                                             # where it inflated total demand by ~3.5% (32.09 "assumed"
+                                             # days of energy vs 31.00 real calendar days).
+GAP_NORMAL_MAX_MIN = 6.0                    # <= this: normal jitter, integrate with real dt
+GAP_SHORT_MAX_MIN = 30.0                    # <= this (and > normal): still integrate with real dt,
+                                             # but flagged `gap_interpolated` for audit
+                                             # >  this: genuine device-offline window — excluded from
+                                             # energy integration entirely (dt_hours forced to 0),
+                                             # flagged `gap_excluded`
 SLAB_TIERS = [(100, 7.5), (300, 11.5), (500, 15.5), (float("inf"), 17.5)]  # (upper bound kWh, Rs/kWh)
 
 BATTERY_PRESETS = {
@@ -37,30 +53,6 @@ INVERTER_ORDER = ["grid_tie", "dumb", "smart"]
 INVERTER_LABELS = {"grid_tie": "Grid-Tie", "dumb": "Dumb Hybrid", "smart": "Smart Hybrid"}
 
 
-# =====================================================================
-# LEAD-ACID LIVE SOC — COULOMB COUNTING (NEW — additive only, does not
-# touch any existing formula above/below). This is for the LIVE battery
-# telemetry payload from the field devices:
-#     status / chemistry / voltage / soc / chargingCurrent /
-#     dischargingCurrent / backupTime
-# — a different pipeline from the historical-CSV PV/load simulator in this
-# file. Lithium's `soc` field already comes fused from its own BMS
-# (coulomb counting + OCV recalibration + balancing done onboard), so it
-# can be trusted directly and needs no extra formula here. Lead-acid
-# telemetry only gives voltage + charge/discharge current, and lead-acid
-# voltage sags/rises too much under load to trust a voltage-only SOC
-# mid-cycle, so its SOC must be tracked via coulomb (Ah) counting instead —
-# exactly as specified by the manager:
-#
-#     SOC2 = SOC1 - (Current * Time / Capacity) * 100
-#
-# with the anchoring rule: "wait for full charge of the battery, then take
-# SOC as 100%; after that, keep incrementing/decrementing SOC based on Ah
-# in/out." Coulomb counting alone has no absolute reference and drifts over
-# time (current-sensor offset, integration error, self-discharge,
-# temperature), so it must be periodically re-anchored to a known point —
-# a detected full charge is that point.
-# =====================================================================
 LEAD_ACID_STATUS_NONE = 0
 LEAD_ACID_STATUS_DISCHARGING = 1
 LEAD_ACID_STATUS_CHARGING = 2
@@ -68,26 +60,8 @@ LEAD_ACID_STATUS_CHARGING = 2
 LEAD_ACID_FULL_CHARGE_VOLTAGE_DEFAULT = 54.0     # float/absorption voltage for a 48V bank — tune to the charger's real set-point
 LEAD_ACID_FULL_CHARGE_TAPER_FRACTION = 0.02      # "full" once charging current tapers below 2% of capacity_Ah
 
-# --- Coulombic charge efficiency & Peukert correction (both LEAD-ACID SPECIFIC) ---
-# These are NOT applied by default inside the function below (defaults = no-op,
-# so the previously verified manager's worked example, 80% -> 40%, is unchanged
-# unless these are explicitly turned on). The UI panel below sets realistic
-# defaults for actual field use. See the accompanying explanation for why each
-# one matters for lead-acid but not lithium.
 LEAD_ACID_CHARGE_EFFICIENCY_DEFAULT = 0.85   # ~80-90% typical for flooded/AGM lead-acid (see notes below)
 
-# Peukert exponent + reference discharge rate — CALIBRATED from the actual vendor
-# spec sheet for this fleet's 200Ah lead-acid battery (both the 24V and 48V wired
-# variants, Small/Medium/Heavy backup points — 6 data points total). Fitting
-# ln(t) = ln(Cp) - k*ln(I) by least squares gives k=1.454, Cp=791.5 (A^k * h),
-# and predicts all 6 vendor-listed "Backup time from Peukart equation" values to
-# within rounding (e.g. 24V/Small: predicted 5.37h vs vendor's 5.4h). This is a
-# MUCH stronger derating than a generic guess — this specific battery line loses
-# usable capacity fast at higher discharge currents. The nameplate 200Ah figure
-# corresponds to roughly a 9.7-hour discharge rate (~20.7A), close to a C10
-# rating rather than the more commonly assumed C20 — that's the reference rate
-# used below. Re-fit these two numbers from the datasheet if a different lead-
-# acid model/vendor is used.
 LEAD_ACID_PEUKERT_EXPONENT_DEFAULT = 1.45
 LEAD_ACID_PEUKERT_REFERENCE_RATE_HOURS_DEFAULT = 9.7   # capacity_ah / this = reference discharge current
 
@@ -97,11 +71,6 @@ LEAD_ACID_PEUKERT_REFERENCE_RATE_HOURS_DEFAULT = 9.7   # capacity_ah / this = re
 # default stays at 1.0 (no sag) unless you have the pack's actual figure.
 LEAD_ACID_DISCHARGE_VOLTAGE_SAG_DEFAULT = 0.95
 LITHIUM_DISCHARGE_VOLTAGE_SAG_DEFAULT = 1.0
-
-# Extra system/inverter derate applied on top of the DoD-limited backup time.
-# The vendor sheet's last row ("Backup considering efficiency/losses") is
-# consistently ~87-94% of the DoD row across all 6 rows shown — ~0.90-0.92
-# is a reasonable single representative value; tune per actual inverter spec.
 SYSTEM_EFFICIENCY_LOSS_DEFAULT = 0.92
 
 
@@ -256,14 +225,7 @@ def is_leadacid_fully_charged(
     float_voltage_threshold: float = LEAD_ACID_FULL_CHARGE_VOLTAGE_DEFAULT,
     taper_current_frac: float = LEAD_ACID_FULL_CHARGE_TAPER_FRACTION,
 ) -> bool:
-    """
-    Returns True when telemetry shows the standard lead-acid "battery is
-    full" signal: actively charging, sitting at/above the float/absorption
-    voltage, AND the charging current has tapered down near zero. This is
-    the manager-specified anchor point ("wait for full charge... then take
-    SOC as 100%") — call this every row; when it returns True, snap SOC to
-    100.0 and resume coulomb counting (the function above) from there.
-    """
+    
     if capacity_ah <= 0 or status != LEAD_ACID_STATUS_CHARGING:
         return False
     taper_threshold_a = taper_current_frac * capacity_ah
@@ -291,7 +253,7 @@ def compute_leadacid_soc_series(
       column (the device's own onboard estimate, if it reports one) is only
       used to seed the very first row when `initial_soc_pct` isn't given.
 
-    Anchoring, per the manager's approach: start at `initial_soc_pct` if
+    Anchoring, per the our's approach: start at `initial_soc_pct` if
     given, else at the first row's own reported `soc` if present, else a
     neutral 50% guess — until the first full-charge event anchors SOC to
     100%, after which it is purely incremented/decremented from Ah in/out.
@@ -663,13 +625,47 @@ def preprocess(raw: pd.DataFrame, grid_v_min: float, grid_v_max: float, power_fa
         df[c] = pd.to_numeric(df[c], errors="coerce")
     df = df.dropna(subset=numeric_cols).reset_index(drop=True)
 
-    df["PV_kWh"] = (df["PV1 Input Power(W)"] + df["PV2 Input Power(W)"]) / 1000.0 * DT_HOURS
+    # --- REAL per-row elapsed time, not a fixed 5-minute assumption ---
+    # A real IoT feed rarely lands on an exact 5.00-minute cadence (observed on a real plant file:
+    # mean 4.83 min, with rows as close as 45 seconds apart) — multiplying every row by a fixed
+    # constant instead of its own real elapsed time systematically over/under-counts energy across
+    # a multi-week file (confirmed: ~3.5% inflation over 31 real days on one such file). `dt_raw_h`
+    # is the real backward interval (time since the previous row); `dt_hours` is the GAP-AWARE
+    # value actually used for energy integration, per the same tolerance bands used elsewhere in
+    # this app's data-sanity rules:
+    #   <= 6 min   -> normal logger jitter, integrate with the real interval
+    #   6-30 min   -> short gap, STILL integrate with the real interval (flagged for audit)
+    #   > 30 min   -> genuine device-offline window, EXCLUDED entirely (dt_hours forced to 0 for
+    #                 that row) rather than guessing a power level across an unknown gap
+    # The very first row has no previous row to diff against — seeded with the SECOND row's
+    # interval when available (best real estimate of this feed's actual cadence), else the nominal
+    # DT_HOURS constant as a last-resort fallback.
+    dt_raw_h = df["Timestamp"].diff().dt.total_seconds() / 3600.0
+    if len(dt_raw_h) > 1 and pd.notna(dt_raw_h.iloc[1]):
+        dt_raw_h.iloc[0] = dt_raw_h.iloc[1]
+    else:
+        dt_raw_h.iloc[0] = DT_HOURS if len(dt_raw_h) > 0 else np.nan
+    dt_min = dt_raw_h * 60.0
+
+    gap_flag = np.where(
+        dt_min <= GAP_NORMAL_MAX_MIN, "normal",
+        np.where(dt_min <= GAP_SHORT_MAX_MIN, "gap_interpolated", "gap_excluded"),
+    )
+    df["gap_flag"] = gap_flag
+    df["dt_hours"] = np.where(gap_flag == "gap_excluded", 0.0, dt_raw_h)
+
+    # Instantaneous power (kW), dt-INDEPENDENT — kept alongside the energy columns for any
+    # threshold-style comparison (e.g. "PV has effectively dropped to ~0") that should compare a
+    # POWER level, not an energy amount that would otherwise silently depend on how long this
+    # particular row's interval happened to be.
+    df["PV_kW"] = ((df["PV1 Input Power(W)"] + df["PV2 Input Power(W)"]) / 1000.0).clip(lower=0)
+    df["Load_kW"] = (df["AC output apparent power(VA)"] * power_factor / 1000.0).clip(lower=0)
+
+    df["PV_kWh"] = (df["PV_kW"] * df["dt_hours"]).clip(lower=0)
     # Load is billed/real energy, not the inverter's apparent-power rating draw, so it's
     # derived from AC output apparent power(VA) x power factor rather than read directly
     # off an "active power" column (which isn't populated on every inverter model).
-    df["Load_kWh"] = df["AC output apparent power(VA)"] * power_factor / 1000.0 * DT_HOURS
-    df["PV_kWh"] = df["PV_kWh"].clip(lower=0)
-    df["Load_kWh"] = df["Load_kWh"].clip(lower=0)
+    df["Load_kWh"] = (df["Load_kW"] * df["dt_hours"]).clip(lower=0)
 
     df["Grid_Status"] = ((df["Grid voltage(V)"] >= grid_v_min) & (df["Grid voltage(V)"] <= grid_v_max)).astype(int)
     df["t_of_day"] = df["Timestamp"].dt.time
@@ -695,8 +691,9 @@ def preprocess(raw: pd.DataFrame, grid_v_min: float, grid_v_max: float, power_fa
 # ROW-BY-ROW SIMULATION ENGINE
 # =====================================================================
 def simulate(df: pd.DataFrame, mode: str, tariff: dict, battery: dict = None, reserve_pct: float = 0.20,
-             max_charge_pct: float = 1.0, pv_zero_threshold_kwh: float = 0.0,
-             initial_soc_pct: float = None) -> dict:
+             max_charge_pct: float = 1.0, pv_zero_threshold_kw: float = 0.0,
+             initial_soc_pct: float = None, predrain_mode: bool = False,
+             predrain_floor_pct: float = 0.30, charge_rate_c: float = 0.15) -> dict:
     """
     mode: 'grid_tie' | 'dumb' | 'smart'
 
@@ -751,6 +748,18 @@ def simulate(df: pd.DataFrame, mode: str, tariff: dict, battery: dict = None, re
     discharge_eff = float(np.sqrt(eff_round_trip)) if eff_round_trip > 0 else 0.0
     reserve_soc = usable_kwh * reserve_pct if battery else 0.0
     max_soc = usable_kwh * max_charge_pct if battery else 0.0
+    # Predictive Pre-Drain: an alternate, lower off-solar-hours discharge floor (default 30%),
+    # used INSTEAD OF reserve_soc when enabled — deliberately allowed to sit below reserve_soc,
+    # since the point is to free up spare capacity overnight (on a site with known-light night
+    # load) rather than to guarantee outage backup. `predrain_floor_pct` arrives already as a
+    # 0-1 fraction (sidebar divides by 100 before passing it in), same convention as reserve_pct.
+    predrain_floor_soc = usable_kwh * predrain_floor_pct if battery else 0.0
+    # C-rate charge cap: real battery/charger hardware can't absorb unlimited kW in one interval
+    # just because PV or grid supply is available — caps kWh chargeable in ANY single row, on
+    # both chemistries and both the PV-charging and grid-charging paths (applied uniformly below).
+    # Computed PER ROW inside the loop now (from that row's own real `dt_hours`), NOT from the
+    # fixed DT_HOURS constant — a row spanning a shorter or longer real interval can physically
+    # absorb correspondingly less or more energy at a fixed C-rate.
 
     # Starting SOC is configurable (real telemetry rarely starts at a convenient 100%). Defaults
     # to the max-charge ceiling if not given, preserving old behaviour for anyone not using this.
@@ -762,13 +771,16 @@ def simulate(df: pd.DataFrame, mode: str, tariff: dict, battery: dict = None, re
     grid_cost_basis = 0.0
     soc = soc_pv + soc_grid
 
-    def charge_from_pv(pv_available_kwh: float, room_kwh: float):
+    def charge_from_pv(pv_available_kwh: float, room_kwh: float, max_charge_kwh: float):
         """PV-origin charging, WITH charge_eff loss now applied (previously lossless).
         Returns (soc_increase, pv_consumed) — soc_increase <= pv_consumed whenever charge_eff<1,
         modeling real converter/charging loss on this leg just like the grid-charging leg below.
+        `max_charge_kwh` is THIS ROW'S OWN C-rate cap (0.15C x usable_kWh x this row's real
+        dt_hours) — passed in per-call since it varies row-to-row with real elapsed time.
         """
         if pv_available_kwh <= 0 or room_kwh <= 0 or charge_eff <= 0:
             return 0.0, 0.0
+        room_kwh = min(room_kwh, max_charge_kwh)
         soc_increase = min(pv_available_kwh * charge_eff, room_kwh)
         pv_consumed = soc_increase / charge_eff
         return soc_increase, pv_consumed
@@ -801,10 +813,28 @@ def simulate(df: pd.DataFrame, mode: str, tariff: dict, battery: dict = None, re
     cur_cycle = None
 
     row_cycle_ids, row_grid_import, row_pv_export, row_actual_bill = [], [], [], []
+    # Daily-breakdown tracking ("Today Earning" = Solar Savings + TOD Optimization + Outage
+    # Savings, computed PER CALENDAR DAY) — captured alongside the existing cycle-level totals
+    # above, not instead of them. Each row's contribution to baseline/TOD/outage is recorded
+    # individually here, using the SAME rate_baseline / rate_now the cycle totals already use —
+    # i.e. still priced off the running CYCLE-cumulative slab position (`baseline_cum_cycle` /
+    # `actual_cum_cycle`), which only resets at real billing-cycle boundaries, never at midnight.
+    # Grouping these already-correctly-priced row values by calendar day afterwards is what lets
+    # "today's" earning still reflect "which slab tier / TOD bucket was I in, given how much I'd
+    # already consumed THIS CYCLE by today" — exactly right, since slabs are a cycle concept, not
+    # a daily one, and must never be reset per day.
+    row_dates, row_baseline_bill, row_tod, row_outage_bill, row_cum_before = [], [], [], [], []
 
     for row in df.itertuples(index=False):
         pv, load, grid_up, t, cyc = row.PV_kWh, row.Load_kWh, bool(row.Grid_Status), row.t_of_day, row.cycle_id
+        pv_kw, row_dt_h = row.PV_kW, row.dt_hours
         solar_hr = in_window(t, tariff["solar_start"], tariff["solar_end"])
+        row_date = pd.Timestamp(row.Timestamp).normalize()
+        # C-rate cap for THIS row: 0.15C (or whatever charge_rate_c is set to) x usable_kWh x this
+        # row's own real elapsed time — a row spanning a longer/shorter real interval can
+        # physically absorb correspondingly more/less energy at a fixed C-rate. A gap-excluded
+        # row (dt_hours forced to 0 in preprocess()) correctly caps charging to 0 for that row.
+        max_charge_kwh_row = (charge_rate_c * usable_kwh * row_dt_h) if battery else float("inf")
 
         if cyc != cur_cycle:
             baseline_cum_cycle = 0.0
@@ -814,6 +844,10 @@ def simulate(df: pd.DataFrame, mode: str, tariff: dict, battery: dict = None, re
         row_grid_import_amt = 0.0
         row_export_amt = 0.0
         row_bill_amt = 0.0
+        row_baseline_amt = 0.0
+        row_tod_amt = 0.0
+        row_outage_bill_amt = 0.0
+        cum_before_this_row = baseline_cum_cycle  # slab/bucket position BEFORE this row — for audit
 
         # --- baseline (no-solar-at-all) bill contribution — GRID-UP ROWS ONLY ---
         # A plain no-solar/no-battery house also has no power (and pays nothing) during a real
@@ -824,7 +858,8 @@ def simulate(df: pd.DataFrame, mode: str, tariff: dict, battery: dict = None, re
         # actually served during an outage can still be valued at a sensible marginal rate below.
         rate_baseline = effective_rate(t, baseline_cum_cycle, tariff)
         if grid_up:
-            baseline_bill += rate_baseline * load
+            row_baseline_amt = rate_baseline * load
+            baseline_bill += row_baseline_amt
             baseline_cum_cycle += load
 
         if mode == "grid_tie":
@@ -856,7 +891,7 @@ def simulate(df: pd.DataFrame, mode: str, tariff: dict, battery: dict = None, re
                 u = min(pv, load)
                 pv_to_load += u
                 pv_rem = pv - u
-                charge, pv_used = charge_from_pv(pv_rem, max(max_soc - soc, 0.0))
+                charge, pv_used = charge_from_pv(pv_rem, max(max_soc - soc, 0.0), max_charge_kwh_row)
                 soc_pv += charge
                 soc += charge
                 pv_to_battery += charge
@@ -873,8 +908,8 @@ def simulate(df: pd.DataFrame, mode: str, tariff: dict, battery: dict = None, re
                     row_grid_import_amt += imp
                     grid_import += imp
 
-                if pv <= pv_zero_threshold_kwh and soc < max_soc:
-                    charge_needed = max_soc - soc
+                if pv_kw <= pv_zero_threshold_kw and soc < max_soc:
+                    charge_needed = min(max_soc - soc, max_charge_kwh_row)
                     grid_pull = charge_needed / charge_eff if charge_eff > 0 else 0.0
                     rate_now = effective_rate(t, actual_cum_cycle, tariff)
                     bill_amt = rate_now * grid_pull
@@ -898,7 +933,7 @@ def simulate(df: pd.DataFrame, mode: str, tariff: dict, battery: dict = None, re
                     u = load
                     pv_to_load += u
                     pv_rem = pv - u
-                    charge, pv_used = charge_from_pv(pv_rem, max(max_soc - soc, 0.0))
+                    charge, pv_used = charge_from_pv(pv_rem, max(max_soc - soc, 0.0), max_charge_kwh_row)
                     soc_pv += charge
                     soc += charge
                     pv_to_battery += charge
@@ -906,11 +941,19 @@ def simulate(df: pd.DataFrame, mode: str, tariff: dict, battery: dict = None, re
                     export += pv_rem
                     row_export_amt += pv_rem
                 else:
-                    # PV deficit: battery discharges to cover it, but stops at Reserve_SOC.
+                    # PV deficit: battery discharges to cover it, normally stopping at Reserve_SOC.
+                    # With Predictive Pre-Drain enabled, off-solar-hours discharge instead stops at
+                    # the (typically lower) predrain_floor_soc, so the battery keeps serving load
+                    # further into the night than Reserve SOC alone would allow. The TOD-surcharge
+                    # window naturally gets served FIRST simply because it falls earliest in the
+                    # evening in any realistic tariff — chronological row-by-row processing already
+                    # gives it priority with no extra ordering logic needed; whatever off-solar load
+                    # remains after that keeps draining the battery down to the same floor.
                     u = pv
                     pv_to_load += u
                     deficit = load - pv
-                    avail_above_reserve = max(soc - reserve_soc, 0.0)
+                    effective_floor = predrain_floor_soc if (predrain_mode and not solar_hr) else reserve_soc
+                    avail_above_reserve = max(soc - effective_floor, 0.0)
                     discharge_gross = min(avail_above_reserve, deficit / discharge_eff)
                     from_pv_g, from_grid_g = discharge_from_buckets(discharge_gross)
                     delivered = discharge_gross * discharge_eff
@@ -930,12 +973,18 @@ def simulate(df: pd.DataFrame, mode: str, tariff: dict, battery: dict = None, re
                     if delivered > 0:
                         if tariff.get("surcharge_on") and in_window(t, tariff["tod_start"], tariff["tod_end"]):
                             r2 = effective_rate(t, actual_cum_cycle, tariff)
-                            tod_optimization += delivered_pv * r2 + delivered_grid * (r2 - grid_cost_basis)
+                            row_tod_amt = delivered_pv * r2 + delivered_grid * (r2 - grid_cost_basis)
+                            tod_optimization += row_tod_amt
                         # else: falls under Solar Savings automatically via the residual below —
                         # no separate accumulation needed (see compute_financials()).
 
-                if not solar_hr and soc < reserve_soc:
-                    charge_needed = reserve_soc - soc
+                # This overnight grid-top-up-to-Reserve-SOC block is SKIPPED entirely when
+                # Predictive Pre-Drain is on — the whole point of that mode is to let the battery
+                # keep draining overnight instead of being refilled from the grid; charging only
+                # resumes once solar hours begin (see the PV-charging paths above), subject to the
+                # C-rate cap.
+                if not solar_hr and soc < reserve_soc and not predrain_mode:
+                    charge_needed = min(reserve_soc - soc, max_charge_kwh_row)
                     grid_pull = charge_needed / charge_eff if charge_eff > 0 else 0.0
                     rate_now = effective_rate(t, actual_cum_cycle, tariff)
                     bill_amt = rate_now * grid_pull
@@ -967,10 +1016,11 @@ def simulate(df: pd.DataFrame, mode: str, tariff: dict, battery: dict = None, re
             unserved += load_rem
             row_outage_amt = u + delivered
             outage_served += row_outage_amt
-            outage_bill_notional += row_outage_amt * rate_baseline
+            row_outage_bill_amt = row_outage_amt * rate_baseline
+            outage_bill_notional += row_outage_bill_amt
 
             pv_rem = pv - u
-            charge, pv_used = charge_from_pv(pv_rem, max(max_soc - soc, 0.0))
+            charge, pv_used = charge_from_pv(pv_rem, max(max_soc - soc, 0.0), max_charge_kwh_row)
             soc_pv += charge
             soc += charge
             pv_to_battery += charge
@@ -981,6 +1031,11 @@ def simulate(df: pd.DataFrame, mode: str, tariff: dict, battery: dict = None, re
         row_grid_import.append(row_grid_import_amt)
         row_pv_export.append(row_export_amt)
         row_actual_bill.append(row_bill_amt)
+        row_dates.append(row_date)
+        row_baseline_bill.append(row_baseline_amt)
+        row_tod.append(row_tod_amt)
+        row_outage_bill.append(row_outage_bill_amt)
+        row_cum_before.append(cum_before_this_row)
 
     pv_available = total_pv - (opportunity_loss if mode == "grid_tie" else notional_loss)
     load_served = total_demand - unserved
@@ -1013,6 +1068,11 @@ def simulate(df: pd.DataFrame, mode: str, tariff: dict, battery: dict = None, re
         row_grid_import=row_grid_import,
         row_pv_export=row_pv_export,
         row_actual_bill=row_actual_bill,
+        row_dates=row_dates,
+        row_baseline_bill=row_baseline_bill,
+        row_tod=row_tod,
+        row_outage_bill=row_outage_bill,
+        row_cum_before=row_cum_before,
     )
 
 
@@ -1101,6 +1161,164 @@ def compute_financials(res: dict, net_metering: bool, export_rate: float) -> dic
     res["net_savings"] = net_savings
     res["net_metering"] = net_metering
     return res
+
+
+# =====================================================================
+# TODAY EARNING — the SAME three savings buckets, broken out PER CALENDAR DAY
+# =====================================================================
+def compute_daily_earning(res: dict) -> pd.DataFrame:
+    """
+    "Today Earning" = Solar Savings + TOD Optimization + Outage Savings, for ONE calendar day —
+    the exact same three buckets `compute_financials()` totals for the whole month/cycle, just
+    grouped by day instead of summed over the whole run.
+
+    The critical part (this is what must NOT be gotten wrong): each row's baseline/actual/TOD/
+    outage rupee value was already priced, inside `simulate()`, using the running CYCLE-cumulative
+    slab position (`baseline_cum_cycle` / `actual_cum_cycle`) — that cumulative bucket only resets
+    at a real billing-cycle boundary (`cycle_days`), never at midnight. So grouping those
+    already-correctly-priced row values by calendar day here does NOT re-price anything and does
+    NOT reset the slab per day — "today" correctly still reflects "which slab tier / TOD window
+    was in effect, given how much this CYCLE had already consumed by today," exactly as billing
+    actually works. Do not compute a day's rate from a fresh 0 — always price off the row-level
+    values `simulate()` already produced.
+
+    Net-metering settlement is intentionally NOT applied here: settlement only finalizes at
+    cycle-end and nets a whole cycle's export against a whole cycle's import, so there is no
+    non-arbitrary way to attribute a slice of that lump settlement to one specific day (today's
+    export might end up settling against a different day's import within the same cycle). "Today
+    Earning" is therefore always computed off the pre-settlement, real-time per-row bill
+    (`row_actual_bill` / `actual_bill_gross`, the same figures Non-Net-Metering mode bills at) —
+    i.e. it answers "how much value did solar/battery generate today", independent of how the
+    cycle's settlement mechanics later net things out. This mirrors `compute_financials()`'s own
+    Net Savings identity (`Solar Savings + Outage Savings + TOD Optimization`), just per day
+    instead of per cycle.
+    """
+    rows = pd.DataFrame({
+        "date": res["row_dates"],
+        "baseline": res["row_baseline_bill"],
+        "actual": res["row_actual_bill"],
+        "tod": res["row_tod"],
+        "outage_bill": res["row_outage_bill"],
+        "cum_before": res["row_cum_before"],
+    })
+    daily = rows.groupby("date").agg(
+        baseline_bill=("baseline", "sum"),
+        actual_bill=("actual", "sum"),
+        tod_optimization=("tod", "sum"),
+        outage_savings=("outage_bill", "sum"),
+        cycle_units_at_day_start=("cum_before", "min"),
+        cycle_units_at_day_end=("cum_before", "max"),
+    ).reset_index()
+
+    daily["solar_savings"] = (daily["baseline_bill"] - daily["actual_bill"]) - daily["tod_optimization"]
+    daily["today_earning"] = daily["solar_savings"] + daily["tod_optimization"] + daily["outage_savings"]
+    # Which slab tier was active for most of the day — purely informational, so a developer can
+    # visually confirm the cycle bucket carries over correctly across a midnight boundary instead
+    # of resetting (e.g. day N ends at 420 units, day N+1 should START at 420, not 0).
+    daily["slab_tier_at_day_start_rs_per_kwh"] = daily["cycle_units_at_day_start"].apply(marginal_slab_rate)
+    return daily.sort_values("date").reset_index(drop=True)
+
+
+# =====================================================================
+# OUTAGE / ISLANDING DISTRIBUTION — same analysis previously delivered as a one-off
+# power_cut_distribution.html for a specific plant, now built live for WHATEVER file is
+# currently uploaded, and surfaced right under the "Outage Intervals" metric so it's one click
+# away instead of a separate request each time.
+# =====================================================================
+def compute_outage_distribution(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Detects contiguous Grid_Status==0 (outage) episodes on the CLEANED, already-sorted dataframe
+    and returns one row per episode: start, end, duration, and how much of that duration fell in
+    solar-hours vs off-solar-hours. Duration is summed from each row's own REAL `dt_hours` (not a
+    fixed 5-minute assumption) — same fix as the rest of the app, so an outage spanning rows with
+    irregular real cadence is timed correctly rather than assuming every row = exactly 5 minutes.
+    """
+    d = df[["Timestamp", "Grid_Status", "solar_hr", "dt_hours"]].reset_index(drop=True)
+    is_out = (d["Grid_Status"] == 0).to_numpy()
+    ts = d["Timestamp"].to_numpy()
+    solar_flags = d["solar_hr"].to_numpy()
+    dt_h = d["dt_hours"].to_numpy()
+    episodes = []
+    i, n = 0, len(is_out)
+    while i < n:
+        if is_out[i]:
+            j = i
+            while j < n and is_out[j]:
+                j += 1
+            n_rows = j - i
+            start = pd.Timestamp(ts[i])
+            # "end" is a display estimate only (not used in any energy math) — last outage row's
+            # timestamp plus a nominal interval, to show roughly when the outage cleared.
+            end = pd.Timestamp(ts[j - 1]) + pd.Timedelta(hours=DT_HOURS)
+            episode_dt = dt_h[i:j]
+            episode_solar = solar_flags[i:j]
+            solar_hours = float(episode_dt[episode_solar].sum())
+            offsolar_hours = float(episode_dt[~episode_solar].sum())
+            episodes.append(dict(
+                start=start, end=end, n_rows=n_rows,
+                duration_min=float(episode_dt.sum()) * 60.0,
+                solar_min=solar_hours * 60.0,
+                offsolar_min=offsolar_hours * 60.0,
+                start_hour=start.hour,
+            ))
+            i = j
+        else:
+            i += 1
+    return pd.DataFrame(episodes)
+
+
+def render_outage_distribution(df: pd.DataFrame):
+    ep_df = compute_outage_distribution(df)
+    if ep_df.empty:
+        st.success("No outage (Grid_Status = 0) episodes detected in this file — nothing to distribute.")
+        return
+
+    total_min = ep_df["duration_min"].sum()
+    solar_min_total = ep_df["solar_min"].sum()
+    offsolar_min_total = ep_df["offsolar_min"].sum()
+
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Outage Episodes", f"{len(ep_df):,}")
+    m2.metric("Total Outage Duration", f"{total_min/60:,.1f} h")
+    m3.metric("Longest Episode", f"{ep_df['duration_min'].max()/60:,.2f} h")
+    m4.metric("Average Episode", f"{ep_df['duration_min'].mean():,.1f} min")
+
+    st.markdown("**Solar-hours vs off-solar-hours split (of total outage time)**")
+    if total_min > 0:
+        pct_solar = solar_min_total / total_min * 100
+        pct_offsolar = 100 - pct_solar
+        st.progress(min(max(pct_offsolar / 100.0, 0.0), 1.0))
+        st.caption(
+            f"☀️ Solar hours: {solar_min_total/60:,.2f} h ({pct_solar:.1f}%) · "
+            f"🌙 Off-solar hours: {offsolar_min_total/60:,.2f} h ({pct_offsolar:.1f}%) of total outage time. "
+            "Outages during off-solar hours are the ones costing the most in Unserved Load, since PV can't "
+            "help cover them."
+        )
+
+    st.markdown("**Duration-bucket distribution (episode count, split by window)**")
+    bins = [0, 15, 30, 60, 180, 360, 1440, np.inf]
+    labels = ["<15m", "15-30m", "30-60m", "1-3h", "3-6h", "6-24h", ">24h"]
+    ep_df["bucket"] = pd.cut(ep_df["duration_min"], bins=bins, labels=labels, right=False)
+    bucket_split = ep_df.groupby("bucket", observed=False).apply(
+        lambda g: pd.Series({
+            "Solar-hours minutes": g["solar_min"].sum(),
+            "Off-solar-hours minutes": g["offsolar_min"].sum(),
+        })
+    ).reindex(labels).fillna(0.0)
+    st.bar_chart(bucket_split)
+
+    st.markdown("**Hour-of-day distribution (which hour each episode STARTS in)**")
+    hour_counts = ep_df["start_hour"].value_counts().reindex(range(24), fill_value=0).sort_index()
+    hour_counts.index.name = "Hour"
+    st.bar_chart(hour_counts.rename("Episodes starting"))
+
+    with st.expander(f"📋 All {len(ep_df)} episode(s) — raw list"):
+        show_ep = ep_df[["start", "end", "duration_min", "solar_min", "offsolar_min"]].copy()
+        show_ep["start"] = show_ep["start"].dt.strftime("%Y-%m-%d %H:%M")
+        show_ep["end"] = show_ep["end"].dt.strftime("%Y-%m-%d %H:%M")
+        show_ep = show_ep.round(1)
+        show_ep.columns = ["Start", "End", "Duration (min)", "Solar-hours (min)", "Off-solar-hours (min)"]
+        st.dataframe(show_ep, use_container_width=True)
 
 
 # =====================================================================
@@ -1209,15 +1427,57 @@ with st.sidebar:
     )
     reserve_pct = st.slider(
         "Smart Hybrid — Reserve SOC (%, kept for outages during grid-up discharge)", 0, 100, 20,
-        help="Smart Hybrid stops discharging to load (while grid is up) once SOC drops to this level."
+        help="Smart Hybrid stops discharging to load (while grid is up) once SOC drops to this level. "
+             "This is the ORIGINAL behaviour — used whenever Predictive Pre-Drain (below) is OFF, and "
+             "still used during solar hours even when Pre-Drain is ON."
     ) / 100.0
+
+    st.subheader("Smart Hybrid — Predictive Pre-Drain (new, toggleable)")
+    st.caption(
+        "our's proposal: on a low-night-load site, Reserve SOC alone can leave real spare capacity "
+        "unused overnight — capacity that could instead be freed up to absorb more of tomorrow's PV "
+        "(cutting curtailment/notional loss). When ON, Smart Hybrid discharges through the ENTIRE "
+        "off-solar span (not stopping at Reserve SOC) — TOD-surcharge-window load is naturally served "
+        "first since it falls earliest in a typical evening, then remaining off-solar load continues "
+        "to be served — draining down to the lower floor below, UNCONDITIONALLY (regardless of whether "
+        "an outage actually occurs that cycle — the simulation can't know in advance). No grid-charging "
+        "top-up happens overnight while this is on; charging resumes only once solar hours begin, "
+        "subject to the C-rate cap below. Toggle it to compare old vs. new as an extra column."
+    )
+    predrain_mode = st.checkbox(
+        "Enable Predictive Pre-Drain — adds a 4th comparison column (Smart Hybrid, old vs new)",
+        value=False,
+    )
+    predrain_floor_pct = st.slider(
+        "Predictive Pre-Drain — discharge floor (%)", 0, 100, 30, disabled=not predrain_mode,
+        help="Off-solar-hours discharge floor used INSTEAD OF Reserve SOC when Pre-Drain is on. "
+             "Deliberately can be set lower than Reserve SOC — that's the whole point (Reserve SOC is "
+             "sized to guarantee outage backup; this floor is sized to free up room for tomorrow's PV "
+             "on a site where night load is known to be light)."
+    ) / 100.0
+
+    st.subheader("Battery Charge-Rate Cap (C-rate)")
+    st.caption(
+        "Per the our's math (e.g. 200Ah lead-acid ≈ 9.6 kWh usable × 0.15C ≈ 1.44 kWh/hour max): "
+        "caps how fast the battery can charge in ANY single interval, on BOTH chemistries and ALL "
+        "charging paths (PV-charging and grid-charging alike) — a real battery/charger can't absorb "
+        "unlimited kW just because PV or grid supply is available. This is why a full recharge can take "
+        "several hours even with ample PV or grid available."
+    )
+    charge_rate_c = st.number_input(
+        "Max charge rate (C, e.g. 0.15 = 15% of usable capacity per hour)", min_value=0.01, max_value=5.0,
+        value=0.15, step=0.01,
+    )
     pv_zero_threshold_w = st.slider(
         "Dumb Hybrid — Grid charges battery when PV drops below (W)", 0, 200, 20,
         help="Dumb Hybrid can only charge its battery from the grid once PV generation is "
              "effectively zero (below this threshold). While PV is above this, the battery "
              "can only be charged from PV surplus (Generation − Load), never from the grid."
     )
-    pv_zero_threshold_kwh = pv_zero_threshold_w / 1000.0 * DT_HOURS
+    # Kept as a POWER threshold (kW), compared against each row's own instantaneous PV_kW —
+    # dt-independent, unlike an energy threshold would be now that rows have variable real
+    # elapsed time.
+    pv_zero_threshold_kw = pv_zero_threshold_w / 1000.0
 
     st.header("3. Grid Status Threshold")
     grid_v_min, grid_v_max = st.slider(
@@ -1338,7 +1598,7 @@ if "Lead-Acid" in battery_choice:
             "Both corrections below are **lead-acid-specific** — lithium's `soc` telemetry is already "
             "BMS-fused (coulombic efficiency ~98-99%, Peukert exponent ~1.0), so neither applies there. "
             "Both default OFF (charge efficiency = 100%, Peukert = disabled) so the plain formula matches "
-            "the manager's worked example exactly unless you turn these on."
+            "the our's worked example exactly unless you turn these on."
         )
         ec1, ec2 = st.columns(2)
         la_charge_eff_on = ec1.checkbox(
@@ -1383,10 +1643,10 @@ if "Lead-Acid" in battery_choice:
                  "if you don't have a real spec sheet to fit against."
         ) if la_peukert_on else 1.0
 
-    with st.expander("Try it — worked example (matches the manager's spec: 80% start, 20A discharge, 2h → 40%)"):
+    with st.expander("Try it — worked example (matches the our's spec: 80% start, 20A discharge, 2h → 40%)"):
         st.caption(
             "This demo uses the PLAIN formula (no charge efficiency / Peukert) so it always reproduces the "
-            "manager's exact numbers, regardless of the settings above. Those corrections apply when you "
+            "our's exact numbers, regardless of the settings above. Those corrections apply when you "
             "process a real telemetry file below."
         )
         wc1, wc2, wc3, wc4 = st.columns(4)
@@ -1692,6 +1952,104 @@ if df.empty:
     st.stop()
 
 # ---------------------------------------------------------------
+# LOAD MATCHING (product/sizing tool) — optionally REPLACE the real per-row Load_kWh with a
+# flat two-level synthetic profile (X kW solar-hours, Y kW off-solar-hours), while keeping the
+# real PV_kWh and real Grid_Status (grid-up/down timing) exactly as recorded in the uploaded
+# file. Sliders are seeded from THIS file's own real computed averages so the default position
+# reproduces the real data; moving them lets the team see what savings/utilization would look
+# like for a differently-sized customer load. Must run AFTER preprocess() (needs real Load_kWh
+# and t_of_day) and BEFORE simulate() (which consumes Load_kWh).
+# ---------------------------------------------------------------
+df["solar_hr"] = df["t_of_day"].apply(lambda t: in_window(t, tariff["solar_start"], tariff["solar_end"]))
+_solar_mask = df["solar_hr"]
+# Energy-weighted average power = total real kWh in that window / total REAL hours actually
+# covered by those rows (sum of each row's own dt_hours) — NOT mean(Load_kWh)/fixed-DT_HOURS,
+# which would silently re-introduce the same fixed-interval overcounting bug this whole change
+# fixes. A gap-excluded row contributes 0 to both the kWh numerator and the hours denominator, so
+# it's correctly ignored rather than dragging the average down.
+_solar_hours_real = float(df.loc[_solar_mask, "dt_hours"].sum())
+_offsolar_hours_real = float(df.loc[~_solar_mask, "dt_hours"].sum())
+_avg_kw_solar_real = float(df.loc[_solar_mask, "Load_kWh"].sum() / _solar_hours_real) if _solar_hours_real > 0 else 0.0
+_avg_kw_offsolar_real = float(df.loc[~_solar_mask, "Load_kWh"].sum() / _offsolar_hours_real) if _offsolar_hours_real > 0 else 0.0
+
+
+def _time_to_hours(t: dtime) -> float:
+    return t.hour + t.minute / 60.0 + t.second / 3600.0
+
+
+# Window lengths (hours) for the two periods, from the sidebar's own Solar Hours setting — used
+# ONLY to convert between "average kW" and "total kWh for that period", so the slider can be
+# entered in whichever unit the user is actually thinking in.
+_solar_len_h = (_time_to_hours(tariff["solar_end"]) - _time_to_hours(tariff["solar_start"])) % 24
+_solar_len_h = _solar_len_h if _solar_len_h > 0 else 24.0
+_offsolar_len_h = 24.0 - _solar_len_h
+_avg_kwh_solar_real = _avg_kw_solar_real * _solar_len_h
+_avg_kwh_offsolar_real = _avg_kw_offsolar_real * _offsolar_len_h
+
+with st.sidebar:
+    st.header("6. Load Matching (Product Sizing Tool)")
+    st.caption(
+        f"This file's own real average: **{_avg_kw_solar_real:.2f} kW** (≈{_avg_kwh_solar_real:.2f} kWh "
+        f"over the ~{_solar_len_h:.1f}h solar window) during solar hours, **{_avg_kw_offsolar_real:.2f} kW** "
+        f"(≈{_avg_kwh_offsolar_real:.2f} kWh over the ~{_offsolar_len_h:.1f}h off-solar window) during "
+        "off-solar hours."
+    )
+    st.caption(
+        "⚠️ **Don't mix up the two units.** An earlier off-solar-load report gave a TOTAL energy per "
+        "night (~2.3–3 kWh over the ~15h night) — that is NOT the same number as an average kW rate. "
+        f"E.g. 2.3 kWh spread over a ~{_offsolar_len_h:.0f}h night is only "
+        f"~{(2.3/_offsolar_len_h if _offsolar_len_h else 0):.2f} kW average — typing '2.3' straight into a "
+        "kW slider makes the load ~15× too high, which is almost certainly why a high result appeared "
+        "before. Pick whichever unit below matches the number you actually have."
+    )
+    load_matching_on = st.checkbox("Enable Load Matching (synthetic flat load)", value=False)
+    lm_unit = st.radio(
+        "Enter the two load levels as:", ["Average power (kW)", "Total energy per period (kWh)"],
+        horizontal=True, disabled=not load_matching_on,
+        help="'Total energy per period' is the same kind of number as the earlier night-by-night "
+             "kWh report — use that option to type e.g. 2.5 directly as a nightly total instead of "
+             "converting it to an average kW rate yourself.",
+    )
+    if lm_unit.startswith("Total"):
+        lm_kwh_solar = st.slider(
+            "Total energy during solar hours (kWh)", 0.0, round(max(50.0, _avg_kwh_solar_real * 3), 1),
+            round(_avg_kwh_solar_real, 2), 0.1, disabled=not load_matching_on,
+        )
+        lm_kwh_offsolar = st.slider(
+            "Total energy during off-solar hours (kWh)", 0.0, round(max(50.0, _avg_kwh_offsolar_real * 3), 1),
+            round(_avg_kwh_offsolar_real, 2), 0.1, disabled=not load_matching_on,
+        )
+        lm_kw_solar = lm_kwh_solar / _solar_len_h if _solar_len_h > 0 else 0.0
+        lm_kw_offsolar = lm_kwh_offsolar / _offsolar_len_h if _offsolar_len_h > 0 else 0.0
+        st.caption(f"= {lm_kw_solar:.3f} kW (solar hours) / {lm_kw_offsolar:.3f} kW (off-solar hours) average rate.")
+    else:
+        lm_kw_solar = st.slider(
+            "Average load during solar hours (kW)", 0.0, round(max(5.0, _avg_kw_solar_real * 3), 2),
+            round(_avg_kw_solar_real, 2), 0.01, disabled=not load_matching_on,
+        )
+        lm_kw_offsolar = st.slider(
+            "Average load during off-solar hours (kW)", 0.0, round(max(5.0, _avg_kw_offsolar_real * 3), 2),
+            round(_avg_kw_offsolar_real, 2), 0.01, disabled=not load_matching_on,
+        )
+        st.caption(
+            f"≈ {lm_kw_solar * _solar_len_h:.2f} kWh over the solar window / "
+            f"≈ {lm_kw_offsolar * _offsolar_len_h:.2f} kWh over the off-solar window."
+        )
+
+if load_matching_on:
+    # Each row still uses ITS OWN real dt_hours — not the fixed DT_HOURS constant — so the
+    # synthetic profile integrates correctly even on a file with irregular real cadence, instead
+    # of re-introducing the exact overcounting bug this whole change was made to fix.
+    df["Load_kWh"] = np.where(df["solar_hr"], lm_kw_solar * df["dt_hours"], lm_kw_offsolar * df["dt_hours"])
+    st.info(
+        f"⚙️ **Load Matching ACTIVE**: the real measured load has been replaced with a flat "
+        f"**{lm_kw_solar:.2f} kW** (solar hours) / **{lm_kw_offsolar:.2f} kW** (off-solar hours) "
+        "synthetic profile for every calculation below. Real PV generation and real grid-up/down "
+        "timing are unchanged. Turn this off in the sidebar (Section 6) to go back to the real "
+        "measured load."
+    )
+
+# ---------------------------------------------------------------
 # 1. RAW DATA SANITY HEADER
 # ---------------------------------------------------------------
 st.header("🧪 Raw Data Sanity Check")
@@ -1702,18 +2060,29 @@ c1, c2, c3, c4 = st.columns(4)
 c1.metric("Total Raw Load (kWh)", f"{df['Load_kWh'].sum():,.2f}")
 c2.metric("Total Raw PV (kWh)", f"{df['PV_kWh'].sum():,.2f}")
 c3.metric("Intervals / Span", f"{len(df):,} rows / {n_days:.1f} days")
-c4.metric("Outage Intervals", f"{n_outage_rows:,} ({n_outage_rows*DT_HOURS:.1f} h)")
+_outage_hours_real = float(df.loc[df["Grid_Status"] == 0, "dt_hours"].sum())
+c4.metric("Outage Intervals", f"{n_outage_rows:,} ({_outage_hours_real:.1f} h)")
+_n_gap_interp = int((df["gap_flag"] == "gap_interpolated").sum())
+_n_gap_excl = int((df["gap_flag"] == "gap_excluded").sum())
 st.caption(
     f"Date range: {df['Timestamp'].min()} → {df['Timestamp'].max()}. "
-    f"Formulas used: `PV_kWh = (PV1+PV2)/1000 × {DT_HOURS:.4f}h`, "
-    f"`Load_kWh = AC_apparent_power(VA) × PF({power_factor:.2f})/1000 × {DT_HOURS:.4f}h`, "
+    f"Formulas used: `PV_kWh = (PV1+PV2)/1000 × Δt`, "
+    f"`Load_kWh = AC_apparent_power(VA) × PF({power_factor:.2f})/1000 × Δt`, "
+    "where **Δt is each row's own REAL elapsed time** (not a fixed 5-minute assumption) — "
+    f"≤{GAP_NORMAL_MAX_MIN:.0f} min counts as normal jitter, "
+    f"{GAP_NORMAL_MAX_MIN:.0f}-{GAP_SHORT_MAX_MIN:.0f} min still integrates with the real interval "
+    f"({_n_gap_interp:,} row(s) here), and anything over {GAP_SHORT_MAX_MIN:.0f} min is excluded "
+    f"entirely from energy integration ({_n_gap_excl:,} row(s) here) rather than guessed at. "
     f"`Grid_Status = 1` if `{grid_v_min} ≤ V ≤ {grid_v_max}` else `0`, "
     f"billing cycle resets every {cycle_days} days. Verify these totals look sane before trusting the table below."
 )
 
+with st.expander(f"🔌 Click to open the full Outage / Islanding Distribution ({n_outage_rows:,} outage rows)"):
+    render_outage_distribution(df)
+
 with st.expander("Preview cleaned data (first 20 rows)"):
     st.dataframe(
-        df[["Timestamp", "PV_kWh", "Load_kWh", "Grid voltage(V)", "Grid_Status", "cycle_id"]].head(20),
+        df[["Timestamp", "dt_hours", "gap_flag", "PV_kWh", "Load_kWh", "Grid voltage(V)", "Grid_Status", "cycle_id"]].head(20),
         use_container_width=True,
     )
 
@@ -1721,15 +2090,36 @@ with st.expander("Preview cleaned data (first 20 rows)"):
 # Run simulations
 # ---------------------------------------------------------------
 res_gt = simulate(df, "grid_tie", tariff)
-res_dumb = simulate(df, "dumb", tariff, battery, reserve_pct, max_charge_pct, pv_zero_threshold_kwh,
-                     initial_soc_pct=initial_soc_pct)
-res_smart = simulate(df, "smart", tariff, battery, reserve_pct, max_charge_pct, pv_zero_threshold_kwh,
-                      initial_soc_pct=initial_soc_pct)
+res_dumb = simulate(df, "dumb", tariff, battery, reserve_pct, max_charge_pct, pv_zero_threshold_kw,
+                     initial_soc_pct=initial_soc_pct, charge_rate_c=charge_rate_c)
+res_smart = simulate(df, "smart", tariff, battery, reserve_pct, max_charge_pct, pv_zero_threshold_kw,
+                      initial_soc_pct=initial_soc_pct, predrain_mode=False, charge_rate_c=charge_rate_c)
 
-for res in (res_gt, res_dumb, res_smart):
+sim_list = [res_gt, res_dumb, res_smart]
+results = {"grid_tie": res_gt, "dumb": res_dumb, "smart": res_smart}
+_inverter_order = ["grid_tie", "dumb", "smart"]
+_inverter_labels = dict(INVERTER_LABELS)
+
+# Predictive Pre-Drain is a TOGGLE that compares old vs. new: when on, run Smart Hybrid a SECOND
+# time with the new dispatch logic and add it as a 4th column, rather than replacing the existing
+# "smart" result — so the team can see both side by side everywhere results are shown (comparison
+# table, Today Earning selector, Data Transparency audit).
+if predrain_mode:
+    res_smart_predrain = simulate(
+        df, "smart", tariff, battery, reserve_pct, max_charge_pct, pv_zero_threshold_kw,
+        initial_soc_pct=initial_soc_pct, predrain_mode=True, predrain_floor_pct=predrain_floor_pct,
+        charge_rate_c=charge_rate_c,
+    )
+    sim_list.append(res_smart_predrain)
+    results["smart_predrain"] = res_smart_predrain
+    _inverter_order.append("smart_predrain")
+    _inverter_labels["smart_predrain"] = "Smart Hybrid (Predictive Pre-Drain)"
+
+for res in sim_list:
     compute_financials(res, net_metering_enabled, export_rate)
 
-results = {"grid_tie": res_gt, "dumb": res_dumb, "smart": res_smart}
+INVERTER_ORDER = _inverter_order
+INVERTER_LABELS = _inverter_labels
 
 # ---------------------------------------------------------------
 # 2. MAIN COMPARISON TABLE
@@ -1745,6 +2135,53 @@ st.caption(
     "**Total Load Served** is where Grid-Tie diverges — it shuts down completely during an outage, "
     "so anything the house wanted to consume during that window is simply not served. See the "
     "'Total Load Served (kWh)' expander below for the exact arithmetic."
+)
+
+# ---------------------------------------------------------------
+# 2b. TODAY EARNING — the same 3 savings buckets, per calendar day
+# ---------------------------------------------------------------
+st.header("📅 Today Earning — Daily Breakdown")
+st.caption(
+    "Same three buckets as the monthly totals above — **Solar Savings + TOD Optimization + Outage "
+    "Savings** — just grouped by calendar day instead of summed over the whole run. Each day's rupee "
+    "value is still priced using that row's position in the running **billing-cycle** cumulative slab "
+    "count (`cycle_units_at_day_start` below) — the slab/TOD bucket is a CYCLE concept and carries over "
+    "across midnight exactly as it would on a real bill; it is never reset to 0 at the start of a new "
+    "day. Net-metering settlement is intentionally excluded here (it only finalizes at cycle-end and "
+    "can't be non-arbitrarily split across days) — Today Earning always reflects the real-time, "
+    "pre-settlement value solar/battery generated that specific day."
+)
+today_earning_inv = st.selectbox(
+    "Inverter mode for the daily breakdown", [INVERTER_LABELS[i] for i in INVERTER_ORDER],
+    index=INVERTER_ORDER.index("smart"), key="today_earning_inv",
+)
+_te_mode = INVERTER_ORDER[[INVERTER_LABELS[i] for i in INVERTER_ORDER].index(today_earning_inv)]
+daily_df = compute_daily_earning(results[_te_mode])
+st.bar_chart(daily_df.set_index("date")[["solar_savings", "tod_optimization", "outage_savings"]])
+show_daily = daily_df.copy()
+show_daily["date"] = show_daily["date"].dt.strftime("%Y-%m-%d")
+for c in ["baseline_bill", "actual_bill", "solar_savings", "tod_optimization", "outage_savings", "today_earning"]:
+    show_daily[c] = show_daily[c].round(2)
+show_daily["cycle_units_at_day_start"] = show_daily["cycle_units_at_day_start"].round(1)
+show_daily["cycle_units_at_day_end"] = show_daily["cycle_units_at_day_end"].round(1)
+st.dataframe(
+    show_daily[[
+        "date", "solar_savings", "tod_optimization", "outage_savings", "today_earning",
+        "cycle_units_at_day_start", "cycle_units_at_day_end", "slab_tier_at_day_start_rs_per_kwh",
+    ]].rename(columns={
+        "date": "Date", "solar_savings": "Solar Savings (₹)", "tod_optimization": "TOD Optimization (₹)",
+        "outage_savings": "Outage Savings (₹)", "today_earning": "Today Earning (₹)",
+        "cycle_units_at_day_start": "Cycle units consumed at day START (kWh)",
+        "cycle_units_at_day_end": "Cycle units consumed at day END (kWh)",
+        "slab_tier_at_day_start_rs_per_kwh": "Slab rate active at day start (₹/kWh)",
+    }),
+    use_container_width=True,
+)
+st.caption(
+    "Sanity check: `Cycle units consumed at day START` for any day should equal (or be very close to) "
+    "the previous day's `...at day END` — confirms the slab bucket is genuinely carrying over across "
+    "midnight rather than resetting. It only drops back down when a real billing-cycle boundary "
+    f"(every {cycle_days} day(s), per the sidebar setting) is crossed."
 )
 
 # ---------------------------------------------------------------
@@ -1793,7 +2230,9 @@ render_metric(
     "**Apparent Power (VA)** × **Power Factor**, not read directly off an active-power column, since PF varies "
     "by site and isn't reliably reported by every inverter model.",
     r"Demand_{total} = \sum_i \frac{S_{AC,i} \times PF}{1000} \times \Delta t,\quad \Delta t = \frac{5}{60}\text{h}",
-    lambda inv, r: f"Sum of all 5-min `AC output apparent power(VA) × PF({power_factor:.2f})/1000 × {DT_HOURS:.4f}h` readings = **{f2(r['total_demand'])} kWh**",
+    lambda inv, r: f"Sum of all `AC output apparent power(VA) × PF({power_factor:.2f})/1000 × Δt` readings, "
+                   "Δt = each row's own real elapsed time (not a fixed interval) = "
+                   f"**{f2(r['total_demand'])} kWh**",
 )
 
 # --- Total Load Served ---
