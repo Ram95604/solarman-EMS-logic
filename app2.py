@@ -22,7 +22,7 @@ GAP_SHORT_MAX_MIN = 30.0                    # <= this (and > normal): still inte
                                              # >  this: genuine device-offline window — excluded from
                                              # energy integration entirely (dt_hours forced to 0),
                                              # flagged `gap_excluded`
-SLAB_TIERS = [(100, 7.5), (300, 11.5), (500, 15.5), (float("inf"), 17.5)]  # (upper bound kWh, Rs/kWh)
+SLAB_TIERS = [(100, 6.45), (300, 14.38), (500, 19.30), (float("inf"), 22.19)]  # (upper bound kWh, Rs/kWh)
 
 BATTERY_PRESETS = {
     "Lithium (48V / 314Ah)": dict(name="Lithium", capacity_kwh=15.07, dod=0.80, efficiency=0.95),
@@ -1481,14 +1481,12 @@ with st.sidebar:
 
     st.header("3. Grid Status Threshold")
     grid_v_min, grid_v_max = st.slider(
-        "Valid Grid Voltage Band (V) — Grid_Status = 1 inside this range", 0, 300, (180, 270),
-        help="Default upper bound raised from 260V to 270V based on real field data: two separate real "
-             "exports from this fleet both showed genuine grid-up readings above 260V (up to 268.2V) — "
-             "260V was flagging real grid-up intervals as outages. Still adjustable per site."
+        "Valid Grid Voltage Band (V) — Grid_Status = 1 inside this range", 0, 300, (180, 260),
+        help=""
     )
 
     st.header("4. Tariff & Billing Cycle")
-    st.caption("Slab reference (fixed): 0–100u @ ₹7.5 · 101–300u @ ₹11.5 · 300–500u @ ₹15.5 · >500u @ ₹17.5")
+    st.caption("Slab reference (fixed): 0–100u @ ₹6.45 · 101–300u @ ₹14.38 · 300–500u @ ₹19.30 · >500u @ ₹22.19")
     cycle_days = st.slider(
         "Slab/billing cycle length (days)", 1, 90, 60,
         help="Cumulative kWh used to pick the slab rate resets to 0 at the start of every "
@@ -1543,7 +1541,7 @@ with st.sidebar:
     )
     net_metering_enabled = net_metering_choice.startswith("Net Metering")
     export_rate = st.number_input(
-        "Non-Net-Metering — PV export earning rate (₹/unit)", min_value=0.0, value=3.0, step=0.10,
+        "Non-Net-Metering — PV export earning rate (₹/unit)", min_value=0.0, value=2.82, step=0.10,
         help="Only used in Non-Net-Metering mode. Paid on min(cycle PV export, cycle grid import)."
     )
 
@@ -1893,8 +1891,7 @@ mapping change, unlike the earlier 7-day sample).
 **3. Grid voltage swings much wider than the 7-day sample suggested: 0V to 268.2V.** 1,214 rows (3.9%)
 read exactly 0V (candidate outages), and 467 rows (1.5%) exceed the default 260V upper threshold —
 roughly 90x more over-260V rows than the smaller sample showed, because a longer window catches more of
-the tail. **Decision: the default Grid Voltage band (180-260V) needs to be widened for this feeder before
-trusting Grid_Status — 260V is clearly too tight; something like 265-270V looks safer given this data.**
+the tail.
 
 **4. Data gaps are much more severe over a full month than the 7-day sample implied.** 34 gaps exceed 60
 minutes; the worst is a ~24.7-hour gap starting 2026-07-20 09:03 (the logger was offline for essentially
