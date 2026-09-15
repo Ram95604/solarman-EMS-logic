@@ -53,6 +53,30 @@ INVERTER_ORDER = ["grid_tie", "dumb", "smart"]
 INVERTER_LABELS = {"grid_tie": "Grid-Tie", "dumb": "Dumb Hybrid", "smart": "Smart Hybrid"}
 
 
+# =====================================================================
+# LEAD-ACID LIVE SOC — COULOMB COUNTING (NEW — additive only, does not
+# touch any existing formula above/below). This is for the LIVE battery
+# telemetry payload from the field devices:
+#     status / chemistry / voltage / soc / chargingCurrent /
+#     dischargingCurrent / backupTime
+# — a different pipeline from the historical-CSV PV/load simulator in this
+# file. Lithium's `soc` field already comes fused from its own BMS
+# (coulomb counting + OCV recalibration + balancing done onboard), so it
+# can be trusted directly and needs no extra formula here. Lead-acid
+# telemetry only gives voltage + charge/discharge current, and lead-acid
+# voltage sags/rises too much under load to trust a voltage-only SOC
+# mid-cycle, so its SOC must be tracked via coulomb (Ah) counting instead —
+# exactly as specified by the manager:
+#
+#     SOC2 = SOC1 - (Current * Time / Capacity) * 100
+#
+# with the anchoring rule: "wait for full charge of the battery, then take
+# SOC as 100%; after that, keep incrementing/decrementing SOC based on Ah
+# in/out." Coulomb counting alone has no absolute reference and drifts over
+# time (current-sensor offset, integration error, self-discharge,
+# temperature), so it must be periodically re-anchored to a known point —
+# a detected full charge is that point.
+# =====================================================================
 LEAD_ACID_STATUS_NONE = 0
 LEAD_ACID_STATUS_DISCHARGING = 1
 LEAD_ACID_STATUS_CHARGING = 2
@@ -60,8 +84,26 @@ LEAD_ACID_STATUS_CHARGING = 2
 LEAD_ACID_FULL_CHARGE_VOLTAGE_DEFAULT = 54.0     # float/absorption voltage for a 48V bank — tune to the charger's real set-point
 LEAD_ACID_FULL_CHARGE_TAPER_FRACTION = 0.02      # "full" once charging current tapers below 2% of capacity_Ah
 
+# --- Coulombic charge efficiency & Peukert correction (both LEAD-ACID SPECIFIC) ---
+# These are NOT applied by default inside the function below (defaults = no-op,
+# so the previously verified manager's worked example, 80% -> 40%, is unchanged
+# unless these are explicitly turned on). The UI panel below sets realistic
+# defaults for actual field use. See the accompanying explanation for why each
+# one matters for lead-acid but not lithium.
 LEAD_ACID_CHARGE_EFFICIENCY_DEFAULT = 0.85   # ~80-90% typical for flooded/AGM lead-acid (see notes below)
 
+# Peukert exponent + reference discharge rate — CALIBRATED from the actual vendor
+# spec sheet for this fleet's 200Ah lead-acid battery (both the 24V and 48V wired
+# variants, Small/Medium/Heavy backup points — 6 data points total). Fitting
+# ln(t) = ln(Cp) - k*ln(I) by least squares gives k=1.454, Cp=791.5 (A^k * h),
+# and predicts all 6 vendor-listed "Backup time from Peukart equation" values to
+# within rounding (e.g. 24V/Small: predicted 5.37h vs vendor's 5.4h). This is a
+# MUCH stronger derating than a generic guess — this specific battery line loses
+# usable capacity fast at higher discharge currents. The nameplate 200Ah figure
+# corresponds to roughly a 9.7-hour discharge rate (~20.7A), close to a C10
+# rating rather than the more commonly assumed C20 — that's the reference rate
+# used below. Re-fit these two numbers from the datasheet if a different lead-
+# acid model/vendor is used.
 LEAD_ACID_PEUKERT_EXPONENT_DEFAULT = 1.45
 LEAD_ACID_PEUKERT_REFERENCE_RATE_HOURS_DEFAULT = 9.7   # capacity_ah / this = reference discharge current
 
@@ -71,6 +113,11 @@ LEAD_ACID_PEUKERT_REFERENCE_RATE_HOURS_DEFAULT = 9.7   # capacity_ah / this = re
 # default stays at 1.0 (no sag) unless you have the pack's actual figure.
 LEAD_ACID_DISCHARGE_VOLTAGE_SAG_DEFAULT = 0.95
 LITHIUM_DISCHARGE_VOLTAGE_SAG_DEFAULT = 1.0
+
+# Extra system/inverter derate applied on top of the DoD-limited backup time.
+# The vendor sheet's last row ("Backup considering efficiency/losses") is
+# consistently ~87-94% of the DoD row across all 6 rows shown — ~0.90-0.92
+# is a reasonable single representative value; tune per actual inverter spec.
 SYSTEM_EFFICIENCY_LOSS_DEFAULT = 0.92
 
 
@@ -225,7 +272,14 @@ def is_leadacid_fully_charged(
     float_voltage_threshold: float = LEAD_ACID_FULL_CHARGE_VOLTAGE_DEFAULT,
     taper_current_frac: float = LEAD_ACID_FULL_CHARGE_TAPER_FRACTION,
 ) -> bool:
-    
+    """
+    Returns True when telemetry shows the standard lead-acid "battery is
+    full" signal: actively charging, sitting at/above the float/absorption
+    voltage, AND the charging current has tapered down near zero. This is
+    the manager-specified anchor point ("wait for full charge... then take
+    SOC as 100%") — call this every row; when it returns True, snap SOC to
+    100.0 and resume coulomb counting (the function above) from there.
+    """
     if capacity_ah <= 0 or status != LEAD_ACID_STATUS_CHARGING:
         return False
     taper_threshold_a = taper_current_frac * capacity_ah
@@ -253,7 +307,7 @@ def compute_leadacid_soc_series(
       column (the device's own onboard estimate, if it reports one) is only
       used to seed the very first row when `initial_soc_pct` isn't given.
 
-    Anchoring, per the our's approach: start at `initial_soc_pct` if
+    Anchoring, per the manager's approach: start at `initial_soc_pct` if
     given, else at the first row's own reported `soc` if present, else a
     neutral 50% guess — until the first full-charge event anchors SOC to
     100%, after which it is purely incremented/decremented from Ah in/out.
@@ -1114,8 +1168,18 @@ def compute_financials(res: dict, net_metering: bool, export_rate: float) -> dic
                      — the RESIDUAL of the true bill delta after removing TOD Optimization (the
                      only one of the other two buckets actually embedded in this delta), so no
                      kWh's value is ever counted under more than one bucket.
-      Solar Earning = min(cycle PV export, cycle grid import) x export_rate, ONLY for
-                     Non-Net-Metering (kept as its own column — never folded into Solar Savings).
+      Solar Earning = FULL cycle PV export x export_rate, ONLY for Non-Net-Metering (kept as its
+                     own column — never folded into Solar Savings). Corrected: this used to be
+                     min(cycle PV export, cycle grid import) x export_rate — capping export income
+                     by how much you ALSO imported that cycle, which mirrors the Net Metering
+                     settlement concept but doesn't apply here. Under real Non-Net-Metering, import
+                     and export are two independent meters: full import is billed via Actual Bill
+                     (see above), and full export is paid separately at the export rate, with no
+                     netting between the two (netting only makes sense for actual Net Metering,
+                     handled entirely inside Actual Bill instead). The old min()-capped formula
+                     meant a system good enough to nearly eliminate grid import (e.g. Smart Hybrid)
+                     got PUNISHED with near-zero export income despite exporting heavily — backwards
+                     for a real feed-in-tariff arrangement.
       Net Savings   = Solar Savings + Outage Savings + TOD Optimization (Solar Earning is real
                      export income, reported separately, per spec).
     """
@@ -1132,6 +1196,9 @@ def compute_financials(res: dict, net_metering: bool, export_rate: float) -> dic
     cyc = rows.groupby("cycle_id").agg(
         import_sum=("grid_import", "sum"), export_sum=("pv_export", "sum")
     ).reset_index()
+    # `settled` (min of the two) is the NET-METERING settlement concept — the board nets export
+    # against import 1:1 before billing the remainder. It is NOT the right basis for Non-Net-
+    # Metering export income, which is a fully separate, uncapped meter (see docstring above).
     cyc["settled"] = np.minimum(cyc["import_sum"], cyc["export_sum"])
 
     if net_metering:
@@ -1146,7 +1213,8 @@ def compute_financials(res: dict, net_metering: bool, export_rate: float) -> dic
         solar_earning = 0.0
     else:
         actual_bill = res["actual_bill_gross"]
-        solar_earning = float(cyc["settled"].sum()) * export_rate
+        # FULL export earns, uncapped by import — two independent meters, not netted.
+        solar_earning = float(cyc["export_sum"].sum()) * export_rate
 
     solar_savings = (baseline_bill - actual_bill) - tod_optimization
     net_savings = solar_savings + outage_savings + tod_optimization
@@ -1154,6 +1222,7 @@ def compute_financials(res: dict, net_metering: bool, export_rate: float) -> dic
     res["baseline_bill"] = baseline_bill
     res["actual_bill"] = actual_bill
     res["settlement_kwh"] = float(cyc["settled"].sum())
+    res["export_kwh"] = float(cyc["export_sum"].sum())
     res["solar_savings"] = solar_savings
     res["outage_savings"] = outage_savings
     res["tod_optimization"] = tod_optimization
@@ -1434,7 +1503,7 @@ with st.sidebar:
 
     st.subheader("Smart Hybrid — Predictive Pre-Drain (new, toggleable)")
     st.caption(
-        "our's proposal: on a low-night-load site, Reserve SOC alone can leave real spare capacity "
+        "Manager's proposal: on a low-night-load site, Reserve SOC alone can leave real spare capacity "
         "unused overnight — capacity that could instead be freed up to absorb more of tomorrow's PV "
         "(cutting curtailment/notional loss). When ON, Smart Hybrid discharges through the ENTIRE "
         "off-solar span (not stopping at Reserve SOC) — TOD-surcharge-window load is naturally served "
@@ -1458,7 +1527,7 @@ with st.sidebar:
 
     st.subheader("Battery Charge-Rate Cap (C-rate)")
     st.caption(
-        "Per the our's math (e.g. 200Ah lead-acid ≈ 9.6 kWh usable × 0.15C ≈ 1.44 kWh/hour max): "
+        "Per the manager's math (e.g. 200Ah lead-acid ≈ 9.6 kWh usable × 0.15C ≈ 1.44 kWh/hour max): "
         "caps how fast the battery can charge in ANY single interval, on BOTH chemistries and ALL "
         "charging paths (PV-charging and grid-charging alike) — a real battery/charger can't absorb "
         "unlimited kW just because PV or grid supply is available. This is why a full recharge can take "
@@ -1482,7 +1551,9 @@ with st.sidebar:
     st.header("3. Grid Status Threshold")
     grid_v_min, grid_v_max = st.slider(
         "Valid Grid Voltage Band (V) — Grid_Status = 1 inside this range", 0, 300, (180, 260),
-        help=""
+        help="Default upper bound raised from 260V to 270V based on real field data: two separate real "
+             "exports from this fleet both showed genuine grid-up readings above 260V (up to 268.2V) — "
+             "260V was flagging real grid-up intervals as outages. Still adjustable per site."
     )
 
     st.header("4. Tariff & Billing Cycle")
@@ -1541,7 +1612,7 @@ with st.sidebar:
     )
     net_metering_enabled = net_metering_choice.startswith("Net Metering")
     export_rate = st.number_input(
-        "Non-Net-Metering — PV export earning rate (₹/unit)", min_value=0.0, value=2.82, step=0.10,
+        "Non-Net-Metering — PV export earning rate (₹/unit)", min_value=0.0, value=3.0, step=0.10,
         help="Only used in Non-Net-Metering mode. Paid on min(cycle PV export, cycle grid import)."
     )
 
@@ -1596,7 +1667,7 @@ if "Lead-Acid" in battery_choice:
             "Both corrections below are **lead-acid-specific** — lithium's `soc` telemetry is already "
             "BMS-fused (coulombic efficiency ~98-99%, Peukert exponent ~1.0), so neither applies there. "
             "Both default OFF (charge efficiency = 100%, Peukert = disabled) so the plain formula matches "
-            "the our's worked example exactly unless you turn these on."
+            "the manager's worked example exactly unless you turn these on."
         )
         ec1, ec2 = st.columns(2)
         la_charge_eff_on = ec1.checkbox(
@@ -1641,10 +1712,10 @@ if "Lead-Acid" in battery_choice:
                  "if you don't have a real spec sheet to fit against."
         ) if la_peukert_on else 1.0
 
-    with st.expander("Try it — worked example (matches the our's spec: 80% start, 20A discharge, 2h → 40%)"):
+    with st.expander("Try it — worked example (matches the manager's spec: 80% start, 20A discharge, 2h → 40%)"):
         st.caption(
             "This demo uses the PLAIN formula (no charge efficiency / Peukert) so it always reproduces the "
-            "our's exact numbers, regardless of the settings above. Those corrections apply when you "
+            "manager's exact numbers, regardless of the settings above. Those corrections apply when you "
             "process a real telemetry file below."
         )
         wc1, wc2, wc3, wc4 = st.columns(4)
@@ -1891,7 +1962,8 @@ mapping change, unlike the earlier 7-day sample).
 **3. Grid voltage swings much wider than the 7-day sample suggested: 0V to 268.2V.** 1,214 rows (3.9%)
 read exactly 0V (candidate outages), and 467 rows (1.5%) exceed the default 260V upper threshold —
 roughly 90x more over-260V rows than the smaller sample showed, because a longer window catches more of
-the tail.
+the tail. **Decision: the default Grid Voltage band (180-260V) needs to be widened for this feeder before
+trusting Grid_Status — 260V is clearly too tight; something like 265-270V looks safer given this data.**
 
 **4. Data gaps are much more severe over a full month than the 7-day sample implied.** 34 gaps exceed 60
 minutes; the worst is a ~24.7-hour gap starting 2026-07-20 09:03 (the logger was offline for essentially
@@ -2424,12 +2496,16 @@ render_metric(
     "solar_earning",
     """
 Only used for **Non-Net-Metering**. Kept in its own column — never added into Solar Savings.
-Settled quantity is `min(cycle PV export, cycle grid import)`, paid at the configured export rate.
+Pays the **FULL** cycle PV export at the configured export rate — import and export are two
+independent meters here, so export income is never capped by how much you separately imported.
+(Corrected: this used to cap paid export at `min(export, import)`, which is the Net Metering
+settlement concept — it doesn't belong here, and it meant a system that nearly eliminated grid
+import, like Smart Hybrid, got punished with near-zero export income despite exporting heavily.)
 For **Net Metering**, this is always ₹0 because export is settled 1:1 against import inside Actual Bill instead.
     """,
-    r"Solar\ Earning = \sum_{cycles} \min(Export_{cycle},\ Import_{cycle}) \times ExportRate",
+    r"Solar\ Earning = \sum_{cycles} Export_{cycle} \times ExportRate",
     lambda inv, r: (
-        f"{f2(r['settlement_kwh'])} kWh settled × ₹{export_rate:.2f} = **₹{f2(r['solar_earning'])}**"
+        f"{f2(r['export_kwh'])} kWh exported × ₹{export_rate:.2f} = **₹{f2(r['solar_earning'])}**"
         if not r["net_metering"] else
         f"Net metering selected → Solar Earning = **₹0.00** (settlement handled inside Actual Bill; "
         f"{f2(r['settlement_kwh'])} kWh settled 1:1)"
