@@ -31,6 +31,7 @@ BATTERY_PRESETS = {
 METRIC_ORDER = [
     "pv_available", "total_demand", "load_served", "pv_to_load", "pv_export", "batt_to_load",
     "grid_to_battery", "grid_import", "unserved",
+    "baseline_bill", "actual_bill",
     "solar_savings", "tod_optimization", "outage_savings", "solar_earning", "net_savings",
 ]
 METRIC_LABELS = {
@@ -43,6 +44,11 @@ METRIC_LABELS = {
     "grid_to_battery": "Grid → Battery Charging (kWh)",
     "grid_import": "Grid Import (kWh)",
     "unserved": "Unserved Load (kWh)",
+    # Both bills are now shown explicitly, right above Solar Savings — Solar Savings is
+    # literally their difference (minus TOD), so showing only the result forced the reader
+    # to take the two inputs on trust.
+    "baseline_bill": "Expected Bill — no solar/battery (Rs)",
+    "actual_bill": "Actual Bill — really paid (Rs)",
     "solar_savings": "Solar Savings (Rs)",
     "tod_optimization": "TOD Optimization Savings (Rs)",
     "outage_savings": "Outage Savings (Rs)",
@@ -652,6 +658,512 @@ def effective_rate(t: dtime, cum_units: float, tariff: dict) -> float:
     if tariff.get("rebate_on") and in_window(t, tariff["solar_start"], tariff["solar_end"]):
         rate -= tariff.get("rebate_rate", 0.0)
     return max(rate, 0.0)
+
+
+# =====================================================================
+# NEW-GENERATION IoT SCHEMA ADAPTER
+# ---------------------------------------------------------------------
+# The newly installed IoT devices publish on a COMPLETELY different schema
+# from the original plant CSV export this app was built around:
+#
+#   OLD (single flat CSV)          NEW (multi-sheet workbook, camelCase)
+#   ---------------------------    -------------------------------------
+#   Timestamp                      receivedAt
+#   PV1 Input Power(W)             pvPower
+#   PV2 Input Power(W)             pv2Power
+#   AC output apparent power(VA)   outputApparentPower
+#   Grid voltage(V)                gridVoltage
+#   (load PF was an ASSUMPTION)    activePowerOutput   <- real active power, no PF needed
+#   (grid import was INFERRED)     gridPower           <- measured directly
+#   (battery SOC was SIMULATED)    batterySoc / batteryCapacityInv
+#   (battery power was SIMULATED)  batteryChargingCurrent / batteryDischargingCurrent
+#
+# Shape of the new workbook: one pair of sheets per device, "<id>_Device"
+# and "<id>_Battery", ALIGNED ROW-FOR-ROW (same row count, same order; the
+# 4 shared columns imei/receivedAt/topic/messageType are byte-identical
+# between the pair). Each sheet interleaves two message types, and — this
+# is the important part — EVERY telemetry field is blank on every
+# `BatteryInfo` row, on both sheets. So the usable telemetry rows are the
+# `DeviceStatus` rows only, which is typically 25-50% of the file.
+#
+# EVERYTHING BELOW IS ADDITIVE. The legacy CSV path is untouched: this
+# adapter simply RENAMES the new fields into the legacy column names that
+# preprocess() already expects, so the entire downstream engine (preprocess
+# -> simulate -> compute_financials) runs completely unchanged.
+#
+# Where the new data is genuinely AMBIGUOUS, this module does NOT guess
+# silently — it returns a list of `assumptions`, each of which the UI
+# renders as a visible, user-overridable control with the observed
+# evidence printed next to it (see the "Data Interpretation" panel).
+# =====================================================================
+NEW_IOT_DEVICE_SUFFIX = "_Device"
+NEW_IOT_BATTERY_SUFFIX = "_Battery"
+NEW_IOT_TELEMETRY_MSGTYPE = "DeviceStatus"
+
+# Minimum set of new-schema field names that must be present for us to be
+# confident this really is the new IoT format and not something else.
+NEW_IOT_SIGNATURE_FIELDS = {"receivedAt", "messageType", "gridVoltage", "pvPower", "outputApparentPower"}
+
+# Direct field renames: new schema -> the legacy column name preprocess() wants.
+NEW_IOT_COLUMN_MAP = {
+    "receivedAt": "Timestamp",
+    "pvPower": "PV1 Input Power(W)",
+    "pv2Power": "PV2 Input Power(W)",
+    "outputApparentPower": "AC output apparent power(VA)",
+    "gridVoltage": "Grid voltage(V)",
+}
+
+# Extra new-schema fields carried through UNMAPPED, for diagnostics and for
+# the measured-vs-simulated cross-checks the UI offers. preprocess() ignores
+# any column it doesn't recognise, so passing these through is harmless.
+NEW_IOT_PASSTHROUGH = [
+    "activePowerOutput", "gridPower", "cumulativeLoad", "cumulativeGridPower",
+    "cumulativeGridExport", "pvEnergyToday", "pvEnergyTotal",
+    "batterySoc", "batteryCapacityInv", "batteryChemistry", "batteryType",
+    "batteryVoltage", "batteryChargingCurrent", "batteryDischargingCurrent",
+    "batteryStatus", "operatingStatus", "workMode",
+    "maxTotalChargingCurrent", "maxChargingCurrentOfMains",
+]
+
+# batteryChemistry is the field whose values actually match the documented
+# "0 = Lead-Acid / 1 = Lithium" convention. batteryType is a DIFFERENT field
+# carrying 0/2/5 — see the assumption raised in adapt_new_iot_dataframe().
+NEW_IOT_CHEMISTRY_LEAD_ACID = 0
+NEW_IOT_CHEMISTRY_LITHIUM = 1
+NEW_IOT_CHEMISTRY_LABELS = {0: "Lead-Acid", 1: "Lithium"}
+
+
+def is_new_iot_workbook(sheet_names: "list[str]") -> bool:
+    """True if the sheet names look like the new per-device Device/Battery pairing."""
+    devs = {s[: -len(NEW_IOT_DEVICE_SUFFIX)] for s in sheet_names if s.endswith(NEW_IOT_DEVICE_SUFFIX)}
+    bats = {s[: -len(NEW_IOT_BATTERY_SUFFIX)] for s in sheet_names if s.endswith(NEW_IOT_BATTERY_SUFFIX)}
+    return len(devs & bats) > 0
+
+
+def list_new_iot_devices(sheet_names: "list[str]") -> "list[str]":
+    devs = {s[: -len(NEW_IOT_DEVICE_SUFFIX)] for s in sheet_names if s.endswith(NEW_IOT_DEVICE_SUFFIX)}
+    bats = {s[: -len(NEW_IOT_BATTERY_SUFFIX)] for s in sheet_names if s.endswith(NEW_IOT_BATTERY_SUFFIX)}
+    return sorted(devs & bats)
+
+
+def is_new_iot_flat_frame(df: pd.DataFrame) -> bool:
+    """True if a single flat frame (e.g. a CSV export of one device) is new-schema."""
+    cols = set(df.columns)
+    return len(NEW_IOT_SIGNATURE_FIELDS & cols) >= 4
+
+
+def _num(s: pd.Series) -> pd.Series:
+    return pd.to_numeric(s, errors="coerce")
+
+
+def adapt_new_iot_dataframe(
+    dev: pd.DataFrame,
+    bat: "pd.DataFrame | None" = None,
+    *,
+    tz_shift_hours: float = 5.5,
+    load_source: str = "active",          # "active" | "apparent"
+    grid_zero_means: str = "outage",      # "outage" | "missing"
+    soc_source: str = "auto",             # "auto" | "batterySoc" | "batteryCapacityInv" | "none"
+) -> "tuple[pd.DataFrame, list[dict]]":
+    """
+    Convert ONE device's new-schema telemetry into the legacy column layout that
+    preprocess() consumes, and report every judgement call made along the way.
+
+    Returns (legacy_df, assumptions) where each assumption is a dict:
+        {key, title, decision, evidence, severity, question}
+    `severity` is "critical" | "warning" | "info". Nothing here is silent: the UI
+    renders all of them, and the caller can override every one of the keyword
+    arguments above.
+
+    IMPORTANT: this function never invents data. Where a field the caller asked
+    for is absent or unusable, it says so in `assumptions` and falls back
+    explicitly rather than quietly substituting something else.
+    """
+    A: "list[dict]" = []
+    dev = dev.copy()
+    dev.columns = [str(c).strip() for c in dev.columns]
+    if bat is not None:
+        bat = bat.copy()
+        bat.columns = [str(c).strip() for c in bat.columns]
+
+    # ---- 1. Join the Device and Battery sheets -------------------------------
+    # They are aligned row-for-row by construction (identical row count/order,
+    # and the 4 shared columns are byte-identical). We therefore join on
+    # POSITION, but verify the alignment first and downgrade to a timestamp join
+    # if the assumption doesn't hold for this file.
+    if bat is not None and len(bat) > 0:
+        if len(bat) == len(dev):
+            bat_only = [c for c in bat.columns if c not in dev.columns]
+            merged = pd.concat([dev.reset_index(drop=True),
+                                bat[bat_only].reset_index(drop=True)], axis=1)
+            A.append(dict(
+                key="sheet_join", severity="info",
+                title="Device + Battery sheets joined by row position",
+                decision="Positional join (row N of _Device paired with row N of _Battery).",
+                evidence=f"Both sheets have exactly {len(dev)} rows and identical shared key columns.",
+                question=None,
+            ))
+        else:
+            merged = dev.reset_index(drop=True)
+            A.append(dict(
+                key="sheet_join", severity="critical",
+                title="Device and Battery sheets have DIFFERENT row counts",
+                decision="Battery sheet IGNORED — cannot safely align it to the Device sheet.",
+                evidence=f"_Device has {len(dev)} rows but _Battery has {len(bat)}. All battery "
+                         f"telemetry (SOC, chemistry, currents) is therefore unavailable.",
+                question="Should these sheets be joined on receivedAt instead? Confirm the intended key.",
+            ))
+    else:
+        merged = dev.reset_index(drop=True)
+
+    # ---- 1b. Does this device publish telemetry fields AT ALL? ---------------
+    # Some devices in the fleet emit only the housekeeping envelope (imei, topic,
+    # messageType, firmware versions, operatingStatus) with none of the telemetry
+    # columns present. That is a fundamentally different failure from "columns
+    # exist but are empty", and must not be mistaken for a constant-value test rig.
+    _absent = [c for c in NEW_IOT_COLUMN_MAP if c not in merged.columns]
+    if _absent:
+        _op = merged["operatingStatus"].dropna().unique().tolist() if "operatingStatus" in merged.columns else []
+        A.append(dict(
+            key="fields_absent", severity="critical",
+            title=f"This device does not publish {len(_absent)} of the {len(NEW_IOT_COLUMN_MAP)} required telemetry fields at all",
+            decision="Missing fields are substituted with zeros so the run does not crash — but any result "
+                     "produced from them is meaningless.",
+            evidence=f"Columns entirely ABSENT from the payload (not merely empty): {', '.join(_absent)}. "
+                     f"The sheet carries only {len(merged.columns)} columns."
+                     + (f" operatingStatus reads {_op} on every row." if _op else ""),
+            question="Is this device commissioned and reporting? A payload with no telemetry columns usually "
+                     "means the device never completed setup, or is publishing on a different firmware schema.",
+        ))
+
+    # ---- 2. Keep only rows that actually carry telemetry ---------------------
+    n_all = len(merged)
+    if "messageType" in merged.columns:
+        counts = merged["messageType"].value_counts(dropna=False).to_dict()
+        keep = merged["messageType"].astype(str).eq(NEW_IOT_TELEMETRY_MSGTYPE)
+        dropped_types = {k: v for k, v in counts.items() if str(k) != NEW_IOT_TELEMETRY_MSGTYPE}
+        merged = merged[keep]
+        if dropped_types:
+            A.append(dict(
+                key="msgtype_filter", severity="warning",
+                title=f"Dropped {n_all - len(merged)} of {n_all} rows that carry no telemetry",
+                decision=f"Kept only messageType == '{NEW_IOT_TELEMETRY_MSGTYPE}' rows.",
+                evidence=f"messageType counts in this device: {counts}. Every telemetry field is "
+                         f"blank on the other message type(s), on BOTH sheets.",
+                question="Are BatteryInfo messages supposed to carry a payload? If so this is an "
+                         "ingestion/parser gap and real data is being lost upstream.",
+            ))
+
+    # Some DeviceStatus rows are still entirely blank on telemetry.
+    if "gridVoltage" in merged.columns:
+        before = len(merged)
+        merged = merged[merged["gridVoltage"].notna()]
+        if before != len(merged):
+            A.append(dict(
+                key="blank_telemetry", severity="warning",
+                title=f"Dropped a further {before - len(merged)} telemetry rows that were entirely blank",
+                decision="Rows with a null gridVoltage were removed.",
+                evidence=f"{before - len(merged)} of {before} DeviceStatus rows had no telemetry values at all.",
+                question="Why do some DeviceStatus messages arrive with an empty payload?",
+            ))
+
+    merged = merged.reset_index(drop=True)
+    if len(merged) == 0:
+        A.append(dict(
+            key="empty", severity="critical",
+            title="No usable telemetry rows in this device",
+            decision="Nothing to simulate.",
+            evidence=f"All {n_all} rows were dropped as non-telemetry or blank.",
+            question="Is this device reporting at all? Check its operatingStatus / commissioning state.",
+        ))
+        return pd.DataFrame(columns=list(NEW_IOT_COLUMN_MAP.values())), A
+
+    out = pd.DataFrame(index=merged.index)
+
+    # ---- 3. Timestamp (+ timezone) ------------------------------------------
+    ts = pd.to_datetime(merged["receivedAt"], errors="coerce")
+    try:
+        ts = ts.dt.tz_localize(None)
+    except (TypeError, AttributeError):
+        pass
+    if abs(tz_shift_hours) > 1e-9:
+        ts = ts + pd.to_timedelta(tz_shift_hours, unit="h")
+    out["Timestamp"] = ts
+    A.append(dict(
+        key="timezone", severity="warning",
+        title=f"Timestamps shifted by {tz_shift_hours:+.1f} h to local time",
+        decision=f"`receivedAt` treated as UTC and shifted {tz_shift_hours:+.1f} h.",
+        evidence="The new feed's receivedAt carries a +00:00 offset, whereas the legacy CSV's Timestamp "
+                 "was already local. Solar-hour windows, TOD windows and calendar-day grouping are all "
+                 "LOCAL-time concepts, so an unshifted UTC feed would mis-assign every tariff window.",
+        question="Confirm receivedAt is UTC — and whether it is device time or server-RECEIPT time "
+                 "(the latter carries network delay, which would smear the 5-min cadence).",
+    ))
+
+    # ---- 4. PV ---------------------------------------------------------------
+    out["PV1 Input Power(W)"] = _num(merged.get("pvPower", pd.Series(0.0, index=merged.index))).fillna(0.0)
+    if "pv2Power" in merged.columns:
+        pv2 = _num(merged["pv2Power"]).fillna(0.0)
+        out["PV2 Input Power(W)"] = pv2
+        if float(pv2.abs().sum()) == 0.0:
+            A.append(dict(
+                key="pv2_zero", severity="info",
+                title="PV string 2 reads zero on every row",
+                decision="Treated as a genuine zero (single-string system).",
+                evidence=f"pv2Power is 0 across all {len(pv2)} telemetry rows.",
+                question="Confirm these are single-string installations. If string 2 exists but isn't "
+                         "reported, total PV generation is being UNDER-counted.",
+            ))
+    else:
+        out["PV2 Input Power(W)"] = 0.0
+
+    # ---- 5. Load -------------------------------------------------------------
+    # The new feed reports REAL active power, so the legacy power-factor
+    # assumption can be dropped entirely. We express that by back-converting
+    # active power into an equivalent "apparent power" figure that, once
+    # preprocess() multiplies it by PF, returns the original active power.
+    has_active = "activePowerOutput" in merged.columns and _num(merged["activePowerOutput"]).notna().any()
+    if load_source == "active" and has_active:
+        out["AC output apparent power(VA)"] = _num(merged["activePowerOutput"]).fillna(0.0)
+        out["_load_is_active_power"] = True
+        A.append(dict(
+            key="load_source", severity="info",
+            title="Load taken from measured ACTIVE power (power-factor assumption dropped)",
+            decision="`activePowerOutput` (W) used as the load signal; set the sidebar Power Factor to "
+                     "1.00 so it passes through unscaled.",
+            evidence="The new feed reports real active power directly. The legacy path had to derive load "
+                     "as apparentPower x an ASSUMED power factor — a guess this field removes.",
+            question=None,
+        ))
+    else:
+        out["AC output apparent power(VA)"] = _num(
+            merged.get("outputApparentPower", pd.Series(0.0, index=merged.index))).fillna(0.0)
+        out["_load_is_active_power"] = False
+        A.append(dict(
+            key="load_source", severity="warning",
+            title="Load taken from APPARENT power — power-factor assumption still applies",
+            decision="`outputApparentPower` (VA) used; the sidebar Power Factor still scales it.",
+            evidence=("activePowerOutput is unavailable in this device's data."
+                      if not has_active else "Manually selected in the Data Interpretation panel."),
+            question="Prefer activePowerOutput where available — it removes the PF guess entirely.",
+        ))
+
+    # ---- 6. Grid voltage / outage interpretation -----------------------------
+    gv = _num(merged.get("gridVoltage", pd.Series(0.0, index=merged.index))).fillna(0.0)
+    n_zero = int((gv <= 1.0).sum())
+    pct_zero = 100.0 * n_zero / max(len(gv), 1)
+    if grid_zero_means == "missing" and n_zero:
+        # Treat a 0 V reading as "not reported", NOT as a real outage: carry the
+        # last known good voltage forward so Grid_Status doesn't flip to 0.
+        gv_fixed = gv.where(gv > 1.0).ffill().bfill()
+        if gv_fixed.isna().all():
+            gv_fixed = gv
+        out["Grid voltage(V)"] = gv_fixed
+        A.append(dict(
+            key="grid_zero", severity="critical",
+            title=f"gridVoltage reads 0 V on {n_zero} of {len(gv)} rows ({pct_zero:.0f}%) — treated as NOT REPORTED",
+            decision="0 V readings are forward-filled from the last good reading, so they do NOT count as outages.",
+            evidence=f"{pct_zero:.0f}% of rows read 0 V. A genuine outage rate that high is implausible for a "
+                     f"live site, which is why this interpretation is offered.",
+            question="Is gridVoltage == 0 a REAL outage, or simply 'not reported this cycle'? This single "
+                     "field drives outage/islanding analysis AND the entire baseline bill.",
+        ))
+    else:
+        out["Grid voltage(V)"] = gv
+        if pct_zero >= 50.0:
+            A.append(dict(
+                key="grid_zero", severity="critical",
+                title=f"gridVoltage reads 0 V on {n_zero} of {len(gv)} rows ({pct_zero:.0f}%) — treated as REAL OUTAGES",
+                decision="0 V taken at face value, so these rows are simulated as grid-down.",
+                evidence=f"{pct_zero:.0f}% of rows read 0 V. This will be reported as a {pct_zero:.0f}% outage "
+                         f"rate, which is implausibly high for a live site — the Expected Bill only counts "
+                         f"grid-up rows, so it will come out far too low if these are not real outages.",
+                question="Is gridVoltage == 0 a REAL outage, or simply 'not reported this cycle'? Switch this "
+                         "setting in the Data Interpretation panel to test the other interpretation.",
+            ))
+
+    # ---- 7. Battery chemistry ------------------------------------------------
+    chem_val, chem_label = None, None
+    if "batteryChemistry" in merged.columns:
+        chem = _num(merged["batteryChemistry"]).dropna()
+        uniq = sorted(chem.unique().tolist())
+        if len(uniq) == 1:
+            chem_val = int(uniq[0])
+            chem_label = NEW_IOT_CHEMISTRY_LABELS.get(chem_val, f"unknown ({chem_val})")
+            A.append(dict(
+                key="chemistry", severity="info",
+                title=f"Battery chemistry detected: {chem_label}",
+                decision=f"Read from `batteryChemistry` = {chem_val}.",
+                evidence=f"batteryChemistry is constant at {chem_val} across all telemetry rows.",
+                question=None,
+            ))
+        elif len(uniq) > 1:
+            counts = chem.value_counts().to_dict()
+            chem_val = int(chem.mode().iloc[0])
+            chem_label = NEW_IOT_CHEMISTRY_LABELS.get(chem_val, f"unknown ({chem_val})")
+            A.append(dict(
+                key="chemistry", severity="critical",
+                title="This device reports MORE THAN ONE battery chemistry",
+                decision=f"Used the most frequent value ({chem_val} = {chem_label}) for the whole run.",
+                evidence=f"batteryChemistry value counts: {counts}. A single device cannot have two chemistries.",
+                question="Did the battery physically change mid-window, or is this field unreliable? Until "
+                         "this is resolved the battery preset for this device is a guess.",
+            ))
+    if "batteryType" in merged.columns:
+        bt = sorted(_num(merged["batteryType"]).dropna().unique().tolist())
+        if bt and set(bt) - {0.0, 1.0}:
+            A.append(dict(
+                key="battery_type_field", severity="critical",
+                title="`batteryType` is NOT the chemistry flag — do not use it as one",
+                decision="Chemistry read from `batteryChemistry`; `batteryType` ignored.",
+                evidence=f"batteryType values seen here: {bt}. The documented '0 = Lead-Acid / 1 = Lithium' "
+                         f"convention only fits batteryChemistry (which carries only 0 and 1).",
+                question="What do batteryType's values actually mean? Confirm which field is authoritative.",
+            ))
+
+    # ---- 8. SOC --------------------------------------------------------------
+    soc_series, soc_field = None, None
+    has_soc = "batterySoc" in merged.columns and float(_num(merged["batterySoc"]).fillna(0).abs().sum()) > 0
+    has_cap = "batteryCapacityInv" in merged.columns and float(_num(merged["batteryCapacityInv"]).fillna(0).abs().sum()) > 0
+
+    chosen = soc_source
+    if chosen == "auto":
+        chosen = "batterySoc" if has_soc else ("batteryCapacityInv" if has_cap else "none")
+
+    if chosen == "batterySoc" and has_soc:
+        soc_series, soc_field = _num(merged["batterySoc"]), "batterySoc"
+        A.append(dict(
+            key="soc_source", severity="info",
+            title="Battery SOC read from `batterySoc`",
+            decision="Using the BMS-reported SOC field.",
+            evidence=f"batterySoc is populated and non-zero (range "
+                     f"{soc_series.min():.0f}-{soc_series.max():.0f}%).",
+            question=None,
+        ))
+    elif chosen == "batteryCapacityInv" and has_cap:
+        soc_series, soc_field = _num(merged["batteryCapacityInv"]), "batteryCapacityInv"
+        A.append(dict(
+            key="soc_source", severity="critical",
+            title="Battery SOC substituted from `batteryCapacityInv` — NOT confirmed to be the same quantity",
+            decision="Using batteryCapacityInv as the SOC signal because batterySoc is unusable here.",
+            evidence=("batterySoc is all-zero for this device, while batteryCapacityInv is populated "
+                      f"(range {soc_series.min():.0f}-{soc_series.max():.0f}%). Where BOTH fields carry "
+                      "real values elsewhere in the fleet they correlate 0.63-0.84, and match exactly on "
+                      "Lithium rows — suggestive, but NOT proof they mean the same thing."),
+            question="Is batteryCapacityInv the inverter's ESTIMATED SOC, and batterySoc the BMS-reported "
+                     "one? Which is authoritative? Treat any SOC-derived result for this device as "
+                     "PROVISIONAL until answered.",
+        ))
+    else:
+        A.append(dict(
+            key="soc_source", severity="critical",
+            title="No usable battery SOC in this device's data",
+            decision="Simulation falls back to a fully SIMULATED SOC ledger (the legacy behaviour).",
+            evidence="Both batterySoc and batteryCapacityInv are absent or all-zero.",
+            question="Is SOC only reported for certain battery/BMS types? Smart Hybrid results for this "
+                     "device are a pure what-if, not validated against real battery state.",
+        ))
+
+    if soc_series is not None:
+        out["Measured_SOC_pct"] = soc_series.clip(lower=0, upper=100)
+        out["_soc_field"] = soc_field
+
+    # ---- 9. Pass-through diagnostics ----------------------------------------
+    for c in NEW_IOT_PASSTHROUGH:
+        if c in merged.columns and c not in out.columns:
+            out[c] = merged[c].values
+
+    # ---- 10. Cumulative counters (would be our independent cross-check) ------
+    cum_cols = [c for c in ["cumulativeLoad", "cumulativeGridPower", "cumulativeGridExport",
+                            "pvEnergyToday", "pvEnergyTotal",
+                            "batteryCumulativeChargeEnergy", "batteryCumulativeDischargeEnergy"]
+                if c in merged.columns]
+    if cum_cols:
+        all_zero = [c for c in cum_cols if float(_num(merged[c]).fillna(0).abs().sum()) == 0.0]
+        if all_zero:
+            A.append(dict(
+                key="cumulative_zero", severity="warning",
+                title=f"{len(all_zero)} cumulative energy counter(s) read zero throughout",
+                decision="No independent cross-check available on the computed kWh totals.",
+                evidence=f"All-zero counters: {', '.join(all_zero)}. These meter-style totals would let us "
+                         f"VALIDATE our power-integration maths (power x elapsed time) rather than just "
+                         f"trusting it to be self-consistent.",
+                question="Will these counters start reporting real values? They are the single best "
+                         "automated sanity check we could add.",
+            ))
+
+    # ---- 11. Measured grid power (we currently only INFER grid import) -------
+    if "gridPower" in merged.columns:
+        gp = _num(merged["gridPower"]).fillna(0.0)
+        nz = int((gp != 0).sum())
+        A.append(dict(
+            key="grid_power", severity="info" if nz else "warning",
+            title=("`gridPower` is available — grid import could be MEASURED instead of inferred"
+                   if nz else "`gridPower` exists but reads zero on every row"),
+            decision="Currently NOT used by the simulation — grid import is still derived as the "
+                     "energy-balance residual (Load − PV − Battery), exactly as before.",
+            evidence=f"gridPower is non-zero on {nz} of {len(gp)} rows.",
+            question=("Worth a follow-up: using this measured field would turn grid import from a MODELLED "
+                      "residual into a measurement, and would let us validate the simulated battery ledger."
+                      if nz else "Why is gridPower always zero? It is the field that would let us stop "
+                                 "inferring grid import arithmetically."),
+        ))
+
+    # ---- 12. Span / cadence sanity -------------------------------------------
+    tsv = out["Timestamp"].dropna().sort_values()
+    if len(tsv) > 1:
+        span_days = (tsv.max() - tsv.min()).total_seconds() / 86400.0
+        gaps_min = tsv.diff().dt.total_seconds().div(60).dropna()
+        if span_days < 28:
+            A.append(dict(
+                key="short_span", severity="critical",
+                title=f"Only {span_days:.2f} days of data — too short for a billing simulation",
+                decision="Simulation will still run, but every bill/saving figure is NOT a monthly result.",
+                evidence=f"Data spans {tsv.min():%Y-%m-%d %H:%M} to {tsv.max():%Y-%m-%d %H:%M}. The engine "
+                         f"prices energy against a MONTHLY progressive slab tariff with a cycle-cumulative "
+                         f"counter — a partial window never climbs into the higher slabs.",
+                question="Can we get 30+ continuous days per device, ideally aligned to the real meter "
+                         "billing-cycle start date?",
+            ))
+        big = int((gaps_min > GAP_SHORT_MAX_MIN).sum())
+        if big:
+            A.append(dict(
+                key="big_gaps", severity="warning",
+                title=f"{big} gap(s) longer than {GAP_SHORT_MAX_MIN:.0f} minutes",
+                decision=f"Rows after such a gap get dt_hours = 0, so they contribute NO energy.",
+                evidence=f"Median cadence {gaps_min.median():.2f} min, worst gap {gaps_min.max():.0f} min "
+                         f"({gaps_min.max()/60:.1f} h).",
+                question="Are these device dropouts, connectivity loss, or genuine power-down periods?",
+            ))
+
+    # ---- 13. Constant-value (test-rig) detection -----------------------------
+    # Only meaningful when the fields actually EXIST — a device that publishes no
+    # telemetry columns is diagnosed separately above (key="fields_absent"), and
+    # would otherwise be mislabelled here as a constant-value test rig.
+    probe = [c for c in ["AC output apparent power(VA)", "PV1 Input Power(W)", "Grid voltage(V)"]
+             if c in out.columns]
+    _fields_absent = any(a["key"] == "fields_absent" for a in A)
+    if (not _fields_absent) and len(out) >= 5 and probe and all(_num(out[c]).nunique(dropna=True) <= 1 for c in probe):
+        A.append(dict(
+            key="constant_values", severity="critical",
+            title="Every telemetry value is IDENTICAL on every row — this looks like a test rig, not a live site",
+            decision="Data passed through unchanged, but results from it are meaningless.",
+            evidence=f"{', '.join(probe)} each hold a single constant value across all {len(out)} rows.",
+            question="Is this device a bench/test unit? If so it should be excluded from any fleet analysis.",
+        ))
+
+    return out, A
+
+
+def new_iot_battery_hint(assumptions: "list[dict]") -> "str | None":
+    """Map the detected chemistry onto one of BATTERY_PRESETS' keys, if we can."""
+    for a in assumptions:
+        if a["key"] == "chemistry":
+            if "Lithium" in a["title"] or "Lithium" in str(a.get("decision", "")):
+                return next((k for k in BATTERY_PRESETS if "Lithium" in k), None)
+            if "Lead-Acid" in a["title"] or "Lead-Acid" in str(a.get("decision", "")):
+                return next((k for k in BATTERY_PRESETS if "Lead" in k), None)
+    return None
 
 
 # =====================================================================
@@ -1449,16 +1961,25 @@ hypothetical inverter behaviour on historical PV/load data.
 
 with st.sidebar:
     st.header("1. Data")
-    uploaded = st.file_uploader("Upload 5-min interval CSV", type=["csv"])
+    uploaded = st.file_uploader(
+        "Upload plant data (CSV or Excel)", type=["csv", "xlsx", "xls"],
+        help="Accepts BOTH formats: the original flat plant CSV, and the new IoT platform's "
+             "multi-sheet workbook (one _Device/_Battery sheet pair per device). The format is "
+             "detected automatically."
+    )
     st.caption(
-        "Required columns: `Timestamp`, `PV1 Input Power(W)`, `PV2 Input Power(W)`, "
-        "`AC output apparent power(VA)`, `Grid voltage(V)`"
+        "**Legacy CSV** needs: `Timestamp`, `PV1 Input Power(W)`, `PV2 Input Power(W)`, "
+        "`AC output apparent power(VA)`, `Grid voltage(V)`.  \n"
+        "**New IoT workbook** needs: `receivedAt`, `pvPower`, `pv2Power`, `outputApparentPower`, "
+        "`gridVoltage` (+ `activePowerOutput`, `batterySoc`, `batteryChemistry` where available)."
     )
     power_factor = st.slider(
         "Load Power Factor (PF)", 0.50, 1.00, 0.90, 0.01,
-        help="Load is billed as real/active power, but the field data reports AC output "
+        help="Load is billed as real/active power, but the LEGACY field data reports AC output "
              "Apparent Power (VA). Load_kWh = VA × PF / 1000 × Δt. PF varies by inverter "
-             "and connected load mix — adjust to match the site under test."
+             "and connected load mix — adjust to match the site under test. "
+             "NOTE: when the new IoT feed supplies activePowerOutput (real active power), this "
+             "slider is bypassed automatically — see the Data Interpretation panel."
     )
 
     st.header("2. Battery Configuration")
@@ -1893,14 +2414,168 @@ Worth getting this corrected in the source spec sheet before it's used for real 
 # UI — MAIN
 # =====================================================================
 if not uploaded:
-    st.info("⬅️ Upload your 5-minute interval CSV in the sidebar to run the simulation.")
+    st.info("⬅️ Upload your plant data (legacy CSV or new IoT workbook) in the sidebar to run the simulation.")
     st.stop()
 
+# ---------------------------------------------------------------------
+# FORMAT DETECTION — legacy flat CSV vs the new multi-sheet IoT workbook.
+# Everything below is additive: if the file is the legacy format, nothing
+# changes at all and `raw_df` is produced exactly as it always was.
+# ---------------------------------------------------------------------
+_is_new_iot = False
+_new_iot_assumptions: "list[dict]" = []
+_new_iot_device = None
+_new_iot_frame = None
+
+_fname = (getattr(uploaded, "name", "") or "").lower()
 try:
-    raw_df = pd.read_csv(uploaded)
+    if _fname.endswith((".xlsx", ".xls")):
+        _xl = pd.ExcelFile(uploaded)
+        if is_new_iot_workbook(_xl.sheet_names):
+            _is_new_iot = True
+            _devices = list_new_iot_devices(_xl.sheet_names)
+        else:
+            raw_df = _xl.parse(_xl.sheet_names[0])
+            if is_new_iot_flat_frame(raw_df):
+                _is_new_iot = True
+                _devices = []
+    else:
+        raw_df = pd.read_csv(uploaded)
+        if is_new_iot_flat_frame(raw_df):
+            _is_new_iot = True
+            _devices = []
 except Exception as e:
     st.error(f"Could not read the uploaded file: {e}")
     st.stop()
+
+if _is_new_iot:
+    st.success(
+        "🛰️ **New IoT platform format detected.** The file is being translated into the simulator's "
+        "internal format automatically. Every judgement call made during that translation is listed "
+        "in the **Data Interpretation** panel below — nothing is assumed silently."
+    )
+
+    with st.sidebar:
+        st.header("1b. New IoT Data Interpretation")
+        st.caption(
+            "These controls exist because the new feed is genuinely ambiguous in places. "
+            "Each one is a decision we cannot make from the data alone — change them to test "
+            "how much each assumption actually moves the result."
+        )
+        if _devices:
+            _new_iot_device = st.selectbox(
+                "Device", _devices,
+                help="One _Device/_Battery sheet pair per device. The simulator runs on ONE device "
+                     "at a time — sites differ, so merging them would be meaningless."
+            )
+        _tz_shift = st.number_input(
+            "Timestamp shift from UTC (hours)", -12.0, 14.0, 5.5, 0.5,
+            help="receivedAt appears to be UTC; the tariff's solar-hour and TOD windows are LOCAL-time "
+                 "concepts. 5.5 = IST. Set to 0 if the feed is already local."
+        )
+        _grid_zero_choice = st.radio(
+            "When gridVoltage reads 0 V, treat it as…",
+            ["A real grid outage", "Not reported (carry last reading forward)"],
+            index=0,
+            help="THE most consequential setting on this panel. gridVoltage is the only outage signal "
+                 "the model has, and the Expected Bill counts grid-up rows only. In the sample data 0 V "
+                 "appears on ~91% of rows for some devices, which would be an implausible outage rate."
+        )
+        _load_src_choice = st.radio(
+            "Load signal",
+            ["Measured active power (preferred)", "Apparent power × Power Factor (legacy)"],
+            index=0,
+            help="The new feed reports real active power (activePowerOutput), which removes the "
+                 "power-factor guess entirely. Falls back automatically if the field is absent."
+        )
+        _soc_choice = st.selectbox(
+            "Battery SOC source",
+            ["Auto (batterySoc, else batteryCapacityInv)", "batterySoc only",
+             "batteryCapacityInv only", "Ignore measured SOC"],
+            index=0,
+            help="batterySoc is all-zero on most devices in the sample data, while batteryCapacityInv "
+                 "is populated. They are NOT confirmed to be the same quantity."
+        )
+
+    _soc_map = {
+        "Auto (batterySoc, else batteryCapacityInv)": "auto",
+        "batterySoc only": "batterySoc",
+        "batteryCapacityInv only": "batteryCapacityInv",
+        "Ignore measured SOC": "none",
+    }
+
+    try:
+        if _devices:
+            _dev_df = _xl.parse(f"{_new_iot_device}{NEW_IOT_DEVICE_SUFFIX}")
+            _bat_df = _xl.parse(f"{_new_iot_device}{NEW_IOT_BATTERY_SUFFIX}")
+        else:
+            _dev_df, _bat_df = raw_df, None
+        raw_df, _new_iot_assumptions = adapt_new_iot_dataframe(
+            _dev_df, _bat_df,
+            tz_shift_hours=float(_tz_shift),
+            load_source="active" if _load_src_choice.startswith("Measured") else "apparent",
+            grid_zero_means="outage" if _grid_zero_choice.startswith("A real") else "missing",
+            soc_source=_soc_map[_soc_choice],
+        )
+    except Exception as e:
+        st.error(f"Could not translate the new IoT format: {e}")
+        st.stop()
+
+    # If the adapter supplied real ACTIVE power, neutralise the PF slider so the
+    # measured value passes through unscaled instead of being silently de-rated.
+    _uses_active_power = False
+    if len(raw_df) and "_load_is_active_power" in raw_df.columns:
+        _uses_active_power = bool(raw_df["_load_is_active_power"].iloc[0])
+    # Internal flags are consumed here; drop them so they don't clutter the raw
+    # data-sanity display below (preprocess() ignores unknown columns either way).
+    raw_df = raw_df.drop(columns=[c for c in ("_load_is_active_power", "_soc_field")
+                                  if c in raw_df.columns])
+    if _uses_active_power:
+        if abs(power_factor - 1.0) > 1e-9:
+            st.info(
+                f"ℹ️ Power Factor slider (currently {power_factor:.2f}) has been **overridden to 1.00** for "
+                f"this run: the new feed supplies real ACTIVE power, so applying a PF would double-discount "
+                f"the load. Switch the Load signal to 'Apparent power' in the sidebar if you want the PF back."
+            )
+        power_factor = 1.0
+
+    # ---------------- Data Interpretation panel ----------------
+    _crit = [a for a in _new_iot_assumptions if a["severity"] == "critical"]
+    _warn = [a for a in _new_iot_assumptions if a["severity"] == "warning"]
+    _info = [a for a in _new_iot_assumptions if a["severity"] == "info"]
+
+    st.header("🔎 Data Interpretation — assumptions made about this new IoT file")
+    if _crit:
+        st.error(
+            f"🔴 {len(_crit)} assumption(s) below are UNRESOLVED and can materially change the results. "
+            f"Treat the numbers on this page as PROVISIONAL until the IoT/platform team confirms them."
+        )
+    if _warn:
+        st.warning(f"🟠 {len(_warn)} further judgement call(s) were made — review them below.")
+    if not _crit and not _warn:
+        st.success("✅ No ambiguous assumptions needed for this device's data.")
+
+    _icon = {"critical": "🔴", "warning": "🟠", "info": "🔵"}
+    for _a in _crit + _warn + _info:
+        with st.expander(f"{_icon[_a['severity']]} {_a['title']}", expanded=(_a["severity"] == "critical")):
+            st.markdown(f"**What the app did:** {_a['decision']}")
+            st.markdown(f"**Evidence in this file:** {_a['evidence']}")
+            if _a.get("question"):
+                st.markdown(f"**❓ Open question for the IoT / platform team:** {_a['question']}")
+
+    _hint = new_iot_battery_hint(_new_iot_assumptions)
+    if _hint and _hint != battery_choice:
+        st.warning(
+            f"⚠️ This device's data reports its chemistry as **{_hint.split(' (')[0]}**, but the sidebar "
+            f"is set to **{battery_choice.split(' (')[0]}**. The battery preset drives usable capacity, "
+            f"DoD, efficiency and the C-rate cap — please reconcile before trusting hybrid results."
+        )
+    st.warning(
+        "⚠️ **Battery presets still assume 48 V packs.** Battery voltage in the new fleet's data measures "
+        "roughly 22–29 V, i.e. **24 V systems**. Until the presets are re-based on the real nameplate specs, "
+        "every battery-derived figure (usable kWh, reserve floor, C-rate cap) is scaled off the wrong pack."
+    )
+    st.divider()
 
 # =====================================================================
 # DATA SANITY — FINDINGS & DECISIONS (NEW — for the developer)
@@ -2422,6 +3097,52 @@ render_metric(
 )
 
 # --- Solar Savings ---
+# --- Expected Bill (baseline / counterfactual) ---
+render_metric(
+    "baseline_bill",
+    """
+The **counterfactual** bill: what this household would have paid with **no solar and no battery at all**,
+on exactly the same grid reliability it actually experienced.
+
+Every row's full `Load_kWh` is priced at `effective_rate(time, cycle-cumulative units, tariff)` — i.e. the
+correct progressive **slab tier** for how many units the *billing cycle* had already consumed by that moment,
+plus the TOD surcharge if the row falls in the peak window, minus the solar-hour rebate if it falls in solar
+hours.
+
+**Counted only on grid-up rows.** A plain grid-only house also gets zero service — and pays zero — during a
+real outage, so outage-time load is deliberately excluded from this counterfactual. (The value of energy that
+solar/battery *did* serve during an outage is captured separately, and in full, as **Outage Savings**.)
+
+This figure is identical across all three inverter modes by construction — it describes the house, not the
+inverter.
+    """,
+    r"Expected\ Bill = \sum_{rows,\ Grid\ Up} Load_{row} \times rate(t,\ cum_{cycle})",
+    lambda inv, r: f"**₹{f2(r['baseline_bill'])}** across {f2(r['total_demand'])} kWh of total demand",
+)
+
+# --- Actual Bill (what was really paid) ---
+render_metric(
+    "actual_bill",
+    """
+What was **really billed**, for every kWh genuinely imported from the grid — both to serve load *and* to charge
+the battery. Energy supplied by PV or by the battery is never billed here.
+
+- **Non-Net-Metering**: the live per-row bill, accumulated inside `simulate()` at each row's own correct slab
+  tier, TOD surcharge and solar-hour rebate.
+- **Net Metering**: a true 1:1 settlement — each cycle's export is netted against that cycle's import first,
+  then only the **remaining net import** is re-billed from scratch through the slab tiers
+  (`slab_bill_for_lump_kwh`). It is *not* a scaled-down gross bill, which would mis-price non-linear slabs.
+  Because a real net meter reports only one net number, no per-row TOD/rebate structure survives the netting.
+
+The gap between this and the Expected Bill above is exactly what the solar + battery system saved on the bill.
+    """,
+    r"Actual\ Bill = \begin{cases}\sum_{rows} Import_{row} \times rate(t,\ cum_{cycle}) & \text{Non-Net-Metering}\\ \sum_{cycles} SlabBill(\max(Import - Export,\ 0)) & \text{Net Metering}\end{cases}",
+    lambda inv, r: (
+        f"**₹{f2(r['actual_bill'])}** across {f2(r['grid_import'])} kWh of grid import"
+        + ("  _(net-metering settled)_" if r.get("net_metering") else "")
+    ),
+)
+
 render_metric(
     "solar_savings",
     """
