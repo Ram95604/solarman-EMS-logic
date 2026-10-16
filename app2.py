@@ -35,14 +35,14 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
-from streamlit.engine import (
+from engine import (
     COL_ACTIVE, COL_BAT_SOC, COL_GRID_V, COL_TS_ALT, COL_TS_PRIMARY,
     account, bill_table, derive_flows, fit_local_time_offset, full_cycle_bills,
     estimate_array_size, integrity_report, measured_round_trip, outage_episodes,
     outage_model, outage_slab_working, preprocess,
 )
-from streamlit.dess_loader import load_export
-from streamlit.tariffs import DEFAULT_STATE, STATE_TARIFFS, build_tariff
+from dess_loader import load_export
+from tariffs import DEFAULT_STATE, STATE_TARIFFS, build_tariff
 
 st.set_page_config(page_title="Solar Savings Analysis", layout="wide")
 
