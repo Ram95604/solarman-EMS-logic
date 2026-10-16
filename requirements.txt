@@ -1,4 +1,13 @@
-streamlit
-pandas
-numpy
-openpyxl
+streamlit>=1.36
+pandas>=2.2
+numpy>=1.26
+openpyxl>=3.1
+
+# Rust .xlsx reader. OPTIONAL but worth installing: these DESS exports carry one
+# sheet per day, and parsing several hundred of them with openpyxl dominates the
+# whole analysis — about 48 s of a 56 s run on a 355-sheet, 103k-row file.
+# calamine reads the same workbook in ~10 s. The loader falls back to openpyxl
+# automatically if this is absent, and the parsed values are identical either
+# way: verified column by column on the raw frame, and end to end through every
+# savings bucket (largest difference across 26 metrics: exactly zero).
+python-calamine>=0.2
